@@ -44,3 +44,18 @@ dsh plugin --profile web add "link:/Users/fanxiaokang/dsh-file-drop"
 
 `~/dsh-desktop/`：Electron 壳，`npm start` 启动。自动复用/拉起 `dsh web`（127.0.0.1:3080），
 preload 注入 `window.dshDesktop`（`getPathForFile` + `drainDroppedPaths`），使拖拽直取 Finder 原始路径。
+
+## 视觉引擎基准（modlens，2026-08 实测）
+
+DSH 的 `modlens_read_image` 走 modlens 视觉桥；单次分析为一次结构化输出（summary/OCR/版面/语义/视觉/不确定项）。
+
+| 引擎 | 完整流程耗时 | 结论 |
+| :-- | :-- | :-- |
+| 智谱 **glm-4v-flash**（国内直连，免费） | **~3.7s** | ✅ 当前配置，最优 |
+| 智谱 glm-4.6v | ~17s | ❌ 慢 4.6 倍 |
+| 智谱 glm-4.5v | 失败 | ❌ 不返回符合 schema 的 JSON |
+| Gemini 免费 key（海外） | 429 额度用尽 / 兜底 codex-cli ~14s | ❌ |
+
+配置位置：`~/.modlens/config.json`（`providers.openai` → `baseUrl=https://open.bigmodel.cn/api/paas/v4`，`model=glm-4v-flash`）。
+
+> 端到端等待（贴图→回复）≈ 读图 3.7s + 模型回复生成时间，后者通常是主要部分。
