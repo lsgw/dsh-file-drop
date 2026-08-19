@@ -478,7 +478,7 @@ window.__ModuleLoader__.load({
       }
       if (found.length > 0) appendToDraft(inputActions, getDraft(), found)
       if (failures.length > 0) statusStore.set('✗ 未能定位：' + failures.join('、'))
-      else statusStore.clear()
+      // 成功时不在此处清除：由 DropZone 监听草稿变化、在草稿框渲染后清除
     }
 
     async function processDirectoryLocate(entry, opts) {
@@ -488,12 +488,12 @@ window.__ModuleLoader__.load({
         const result = await locateDroppedDirectory(entry, workspaces, currentWorkspacePath)
         if (result.status === 'found') {
           appendToDraft(inputActions, getDraft(), [result.path])
-          statusStore.clear()
+          // 成功时不在此处清除：由 DropZone 监听草稿变化、在草稿框渲染后清除
         } else if (result.status === 'choose') {
           const picked = choosePathInteractive(entry.name, result.candidates)
           if (picked) {
             appendToDraft(inputActions, getDraft(), [picked])
-            statusStore.clear()
+            // 成功时不在此处清除：由 DropZone 监听草稿变化、在草稿框渲染后清除
           } else {
             statusStore.set('✗ 未选择目录路径')
           }
@@ -599,6 +599,17 @@ window.__ModuleLoader__.load({
           window.removeEventListener('scroll', position, true)
         }
       }, [])
+
+      // 草稿框渲染出路径后，清除「正在定位」提示
+      const prevDraftRef = React.useRef((props.input && props.input.draft) || '')
+      React.useEffect(() => {
+        const currentDraft = (props.input && props.input.draft) || ''
+        const prev = prevDraftRef.current
+        prevDraftRef.current = currentDraft
+        if (currentDraft !== prev && statusText && statusText.indexOf('正在') === 0) {
+          statusStore.clear()
+        }
+      }, [props.input && props.input.draft, statusText])
 
       React.useEffect(() => {
         // 全部挂在 window 捕获阶段：事件流的第一个节点，先于 DSH 自带的
