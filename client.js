@@ -27,6 +27,26 @@ window.__ModuleLoader__.load({
     ])
     const MAX_BYTES = 25 * 1024 * 1024
     const API_PATH = '/api/dsh-file-drop'
+    const SETTINGS_PATH = API_PATH + '/settings'
+    let currentMode = 'upload'
+
+    async function readMode() {
+      try {
+        const res = await fetch(SETTINGS_PATH)
+        const data = await res.json().catch(() => ({}))
+        return data.mode === 'locate' ? 'locate' : 'upload'
+      } catch { return 'upload' }
+    }
+
+    async function writeMode(mode) {
+      try {
+        await fetch(SETTINGS_PATH, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ mode }),
+        })
+      } catch { /* ignore */ }
+    }
 
     // ---- 文件识别与读取 ----
 
@@ -111,6 +131,45 @@ window.__ModuleLoader__.load({
       return paths
     }
 
+    // ---- 目录遍历（webkitGetAsEntry，upload 与 locate 共用） ----
+
+    function readEntryAll(entry) {
+      return new Promise((resolve, reject) => {
+        if (entry.isFile) {
+          entry.file((file) => resolve([{ path: '', file }]), reject)
+          return
+        }
+        if (!entry.isDirectory) { resolve([]); return }
+        const reader = entry.createReader()
+        const out = []
+        const readBatch = () => {
+          reader.readEntries(async (children) => {
+            if (!children || children.length === 0) { resolve(out); return }
+            try {
+              const results = await Promise.all(children.map((child) => readEntryAll(child)))
+              children.forEach((child, i) => {
+                for (const s of results[i]) out.push({ path: child.name + (s.path ? '/' + s.path : ''), file: s.file })
+              })
+              readBatch()
+            } catch (err) { reject(err) }
+          }, reject)
+        }
+        readBatch()
+      })
+    }
+
+    function getDirectoryEntries(items) {
+      const dirs = []
+      if (!items) return dirs
+      for (const item of items) {
+        try {
+          const entry = item.webkitGetAsEntry && item.webkitGetAsEntry()
+          if (entry && entry.isDirectory) dirs.push(entry)
+        } catch { /* 忽略 */ }
+      }
+      return dirs
+    }
+
     // ---- 共享状态（按钮上传与拖拽共用一个状态条） ----
 
     const statusStore = {
@@ -118,6 +177,7 @@ window.__ModuleLoader__.load({
       listeners: new Set(),
       timer: null,
       set(text) {
+        if (currentMode === 'upload') return
         this.value = text
         for (const l of [...this.listeners]) l()
         if (this.timer) clearTimeout(this.timer)
@@ -125,6 +185,12 @@ window.__ModuleLoader__.load({
           this.value = null
           for (const l of [...this.listeners]) l()
         }, 3500)
+      },
+      clear() {
+        if (this.timer) clearTimeout(this.timer)
+        this.timer = null
+        this.value = null
+        for (const l of [...this.listeners]) l()
       },
       subscribe(fn) {
         this.listeners.add(fn)
@@ -140,9 +206,9 @@ window.__ModuleLoader__.load({
 
     function appendToDraft(inputActions, draft, paths) {
       if (!inputActions) return
-      const lines = paths.map((p) => '📎 文件：`' + p + '`')
-      const nl = draft === '' ? '' : '\n'
-      inputActions.setDraft(draft + nl + lines.join('\n'))
+      const lines = paths.map((p) => '`' + p + '`')
+      const sep = draft === '' ? '' : ' '
+      inputActions.setDraft(draft + sep + lines.join(' '))
     }
 
     // 共用处理：壳路径优先，其余走上传兜底
@@ -195,6 +261,248 @@ window.__ModuleLoader__.load({
         errs.length > 0 ? '✗ ' + errs.join('；') : '',
       ].filter(Boolean).join('　')
       statusStore.set(text || '没有文件被处理')
+    }
+
+    // 目录：递归遍历后整包上传，落盘为同名目录，插入目录根路径（upload 方案）
+    async function processDirectoryUpload(entry, opts) {
+      const { sessionId, inputActions, getDraft } = opts
+      const MAX_DIR_FILES = 500
+      statusStore.set('正在读取目录 ' + entry.name + ' …')
+      let all
+      try {
+        all = await readEntryAll(entry)
+      } catch (err) {
+        statusStore.set('✗ 读取目录失败：' + String((err && err.message) || err))
+        return
+      }
+      if (all.length > MAX_DIR_FILES) {
+        all = all.slice(0, MAX_DIR_FILES)
+      }
+      const entries = []
+      const skipped = []
+      for (const { path, file } of all) {
+        if (file.size > MAX_BYTES) { skipped.push(file.name); continue }
+        const payload = looksText(file)
+          ? { kind: 'text', content: await file.text() }
+          : { kind: 'binary', base64: await fileToBase64(file) }
+        entries.push({ path: path || file.name, ...payload })
+      }
+      if (entries.length === 0) {
+        statusStore.set('✗ 目录内没有可上传的文件' + (skipped.length ? '（跳过 ' + skipped.length + ' 个超大文件）' : ''))
+        return
+      }
+      statusStore.set('正在上传目录 ' + entry.name + '（' + entries.length + ' 个文件）…')
+      try {
+        const response = await fetch(API_PATH + '/dir', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ sessionId, dirName: entry.name, entries }),
+        })
+        const data = await response.json().catch(() => ({}))
+        if (response.ok && data.path) {
+          appendToDraft(inputActions, getDraft(), [data.path])
+          statusStore.set('✓ 目录已上传' + (skipped.length ? '（跳过 ' + skipped.length + ' 个超大文件）' : ''))
+        } else {
+          statusStore.set('✗ 目录上传失败：' + (data.error || '保存失败'))
+        }
+      } catch (err) {
+        statusStore.set('✗ 目录上传失败：' + String((err && err.message) || err))
+      }
+    }
+
+    // ---- locate 方案（搜索定位，零拷贝） ----
+
+    const LOCATE_ROUTE = '/file-drop/locate'
+    const LOCATE_SAMPLE_BYTES = 64 * 1024
+    const LOCATE_MAX_DEPTH = 32
+    const LOCATE_MAX_ENTRIES = 10000
+
+    function droppedFileMeta(file) {
+      return { kind: 'file', name: file.name, size: file.size, lastModified: file.lastModified }
+    }
+
+    function hexFromArrayBuffer(buffer) {
+      return [...new Uint8Array(buffer)].map((v) => v.toString(16).padStart(2, '0')).join('')
+    }
+
+    function locateSampleRanges(size) {
+      if (size <= LOCATE_SAMPLE_BYTES * 3) return [{ start: 0, end: size }]
+      const starts = [0, Math.max(0, Math.floor(size / 2) - Math.floor(LOCATE_SAMPLE_BYTES / 2)), size - LOCATE_SAMPLE_BYTES]
+      return starts.map((start) => ({ start, end: Math.min(start + LOCATE_SAMPLE_BYTES, size) }))
+    }
+
+    async function fileSampleFingerprint(file) {
+      const ranges = locateSampleRanges(file.size)
+      const parts = await Promise.all(ranges.map((r) => file.slice(r.start, r.end).arrayBuffer()))
+      const total = parts.reduce((sum, part) => sum + part.byteLength, 8)
+      const combined = new Uint8Array(total)
+      new DataView(combined.buffer).setBigUint64(0, BigInt(file.size))
+      let cursor = 8
+      for (const part of parts) {
+        combined.set(new Uint8Array(part), cursor)
+        cursor += part.byteLength
+      }
+      return hexFromArrayBuffer(await crypto.subtle.digest('SHA-256', combined))
+    }
+
+    async function fileFullFingerprint(file) {
+      return hexFromArrayBuffer(await crypto.subtle.digest('SHA-256', await file.arrayBuffer()))
+    }
+
+    async function locateRequest(body) {
+      const response = await fetch(LOCATE_ROUTE, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const value = await response.json().catch(() => ({}))
+      return response.ok ? value : { status: 'error', message: value.message || ('HTTP ' + response.status) }
+    }
+
+    function readEntryChildren(entry) {
+      const reader = entry.createReader()
+      const out = []
+      return new Promise((resolve, reject) => {
+        const readBatch = () => {
+          reader.readEntries((batch) => {
+            if (!batch || batch.length === 0) { resolve(out); return }
+            out.push(...batch)
+            readBatch()
+          }, reject)
+        }
+        readBatch()
+      })
+    }
+
+    async function readDirectoryStructure(root) {
+      const entries = []
+      let truncated = false
+      const visit = async (directory, prefix, depth) => {
+        if (depth >= LOCATE_MAX_DEPTH) { truncated = true; return }
+        const children = await readEntryChildren(directory)
+        children.sort((a, b) => a.name.normalize('NFC').localeCompare(b.name.normalize('NFC')))
+        for (const child of children) {
+          if (entries.length >= LOCATE_MAX_ENTRIES) { truncated = true; return }
+          const path = prefix === '' ? child.name : prefix + '/' + child.name
+          if (child.isDirectory) {
+            entries.push({ path, kind: 'directory' })
+            await visit(child, path, depth + 1)
+          } else if (child.isFile) {
+            const file = await new Promise((resolve, reject) => child.file(resolve, reject))
+            entries.push({ path, kind: 'file', size: file.size })
+          }
+        }
+      }
+      await visit(root, '', 0)
+      return { entries, truncated }
+    }
+
+    async function findEntryByPath(root, relativePath) {
+      let current = root
+      for (const part of relativePath.split('/')) {
+        if (!current || !current.isDirectory) return undefined
+        current = (await readEntryChildren(current)).find((entry) => entry.name.normalize('NFC') === part.normalize('NFC'))
+        if (current === undefined) return undefined
+      }
+      return current
+    }
+
+    async function readDirectoryContentSamples(root, paths) {
+      const samples = []
+      for (const path of paths) {
+        const entry = await findEntryByPath(root, path)
+        if (entry && entry.isFile === true) {
+          const file = await new Promise((resolve, reject) => entry.file(resolve, reject))
+          samples.push({ path, size: file.size, digest: await fileSampleFingerprint(file) })
+        }
+      }
+      return samples
+    }
+
+    function workspaceContext(workspaces, currentWorkspacePath) {
+      const items = (workspaces && workspaces.list && workspaces.list.getSnapshot && workspaces.list.getSnapshot().items) || []
+      return {
+        workspacePaths: items.map((item) => item.path),
+        ...(currentWorkspacePath === undefined ? {} : { currentWorkspacePath }),
+      }
+    }
+
+    async function locateDroppedFile(file, workspaces, currentWorkspacePath) {
+      const meta = droppedFileMeta(file)
+      const wctx = workspaceContext(workspaces, currentWorkspacePath)
+      let result = await locateRequest({ phase: 'metadata', file: meta, ...wctx })
+      if (result.status !== 'sample-required') return result
+      result = await locateRequest({ phase: 'sample', file: meta, candidates: result.candidates, digest: await fileSampleFingerprint(file) })
+      if (result.status !== 'full-required') return result
+      return locateRequest({ phase: 'full', file: meta, candidates: result.candidates, digest: await fileFullFingerprint(file) })
+    }
+
+    async function locateDroppedDirectory(entry, workspaces, currentWorkspacePath) {
+      const initial = { kind: 'directory', name: entry.name }
+      const wctx = workspaceContext(workspaces, currentWorkspacePath)
+      let result = await locateRequest({ phase: 'metadata', file: initial, ...wctx })
+      if (result.status !== 'directory-structure-required') return result
+      const meta = { ...initial, structure: await readDirectoryStructure(entry) }
+      result = await locateRequest({ phase: 'directory-structure', file: meta, candidates: result.candidates })
+      if (result.status !== 'directory-content-required') return result
+      return locateRequest({ phase: 'directory-content', file: meta, candidates: result.candidates, directorySamples: await readDirectoryContentSamples(entry, result.paths) })
+    }
+
+    function choosePathInteractive(name, candidates) {
+      // 多个候选无法区分时，用简单弹窗让用户选择序号（后续可换成更友好的 UI）
+      const max = candidates.length > 10 ? 10 : candidates.length
+      const lines = candidates.slice(0, max).map((p, i) => '[' + i + '] ' + p).join('\n')
+      const raw = window.prompt('「' + name + '」有多个匹配路径，输入序号选择：\n' + lines)
+      if (raw === null || raw === undefined) return undefined
+      const idx = parseInt(raw, 10)
+      return Number.isInteger(idx) && idx >= 0 && idx < max ? candidates[idx] : undefined
+    }
+
+    async function processFilesLocate(files, opts) {
+      const { inputActions, getDraft, workspaces, currentWorkspacePath } = opts
+      statusStore.set('正在定位文件中…')
+      const found = []
+      const failures = []
+      for (const file of files) {
+        try {
+          const result = await locateDroppedFile(file, workspaces, currentWorkspacePath)
+          if (result.status === 'found') found.push(result.path)
+          else if (result.status === 'choose') {
+            const picked = choosePathInteractive(file.name, result.candidates)
+            if (picked) found.push(picked)
+            else failures.push(file.name)
+          } else failures.push(file.name)
+        } catch (err) {
+          failures.push(file.name)
+        }
+      }
+      if (found.length > 0) appendToDraft(inputActions, getDraft(), found)
+      if (failures.length > 0) statusStore.set('✗ 未能定位：' + failures.join('、'))
+      else statusStore.clear()
+    }
+
+    async function processDirectoryLocate(entry, opts) {
+      const { inputActions, getDraft, workspaces, currentWorkspacePath } = opts
+      statusStore.set('正在定位目录中…')
+      try {
+        const result = await locateDroppedDirectory(entry, workspaces, currentWorkspacePath)
+        if (result.status === 'found') {
+          appendToDraft(inputActions, getDraft(), [result.path])
+          statusStore.clear()
+        } else if (result.status === 'choose') {
+          const picked = choosePathInteractive(entry.name, result.candidates)
+          if (picked) {
+            appendToDraft(inputActions, getDraft(), [picked])
+            statusStore.clear()
+          } else {
+            statusStore.set('✗ 未选择目录路径')
+          }
+        } else {
+          statusStore.set('✗ 未能定位目录：' + entry.name)
+        }
+      } catch (err) {
+        statusStore.set('✗ 未能定位目录：' + entry.name)
+      }
     }
 
     // ---- 组件 ----
@@ -254,6 +562,14 @@ window.__ModuleLoader__.load({
         sessionId: props.sessionId,
         inputActions: props.inputActions,
         getDraft: () => (props.input && props.input.draft) || '',
+        workspaces: props.workspaces,
+        currentWorkspacePath: (() => {
+          try {
+            const s = props.sessions && props.sessions.list && props.sessions.list.getSnapshot()
+            const id = s && s.current
+            return id === undefined ? undefined : (s.byId[id] && s.byId[id].cwd)
+          } catch { return undefined }
+        })(),
       }
 
       React.useEffect(() => {
@@ -318,21 +634,64 @@ window.__ModuleLoader__.load({
           return
         }
 
-        // 普通文件 → 上传兜底
+        // 目录拖拽 → 按模式走「目录上传」或「目录定位」
+        const dirEntries = getDirectoryEntries(e.dataTransfer && e.dataTransfer.items)
+        if (dirEntries.length > 0) {
+          busyRef.current = true
+          try {
+            for (const dirEntry of dirEntries) {
+              if (currentMode === 'locate') {
+                await processDirectoryLocate(dirEntry, optsRef.current)
+              } else {
+                await processDirectoryUpload(dirEntry, optsRef.current)
+              }
+            }
+          } finally {
+            busyRef.current = false
+          }
+          return
+        }
+
+        // 普通文件 → 按模式走「上传兜底」或「搜索定位」
         if (files.length === 0) return
         busyRef.current = true
         try {
-          await processFiles(files, optsRef.current)
+          if (currentMode === 'locate') {
+            await processFilesLocate(files, optsRef.current)
+          } else {
+            await processFiles(files, optsRef.current)
+          }
         } finally {
           busyRef.current = false
         }
       }
 
       return React.createElement(React.Fragment, null,
-        statusText ? React.createElement('div', { className: 'dsh-drop-status' }, statusText) : null,
+        statusText ? React.createElement('div', { className: 'dsh-drop-status' },
+          statusText.indexOf('正在') === 0 ? React.createElement('span', { className: 'dsh-drop-status-spinner' }) : null,
+          React.createElement('span', { className: 'dsh-drop-status-text' }, statusText)
+        ) : null,
         drag ? React.createElement('div', { className: 'dsh-drop-overlay' },
           React.createElement('div', { className: 'dsh-drop-overlay-inner' }, '松开鼠标，获取文件')
         ) : null
+      )
+    }
+
+    // 设置页 section：选择拖拽处理方案
+    function SettingsSection(props) {
+      const [mode, setMode] = React.useState(currentMode)
+      React.useEffect(() => { readMode().then((m) => { currentMode = m; setMode(m) }) }, [])
+      const pick = (m) => { currentMode = m; setMode(m); void writeMode(m) }
+      return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: '10px' } },
+        React.createElement('div', { style: { fontWeight: 600 } }, '拖拽文件处理方式'),
+        React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+          React.createElement('input', { type: 'radio', name: 'dsh-file-drop-mode', checked: mode === 'upload', onChange: () => pick('upload') }),
+          React.createElement('span', null, '上传到工作区（.dsh-drops，稳定可靠）')
+        ),
+        React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+          React.createElement('input', { type: 'radio', name: 'dsh-file-drop-mode', checked: mode === 'locate', onChange: () => pick('locate') }),
+          React.createElement('span', null, '搜索定位原始路径（零拷贝，文件须在可搜索范围内）')
+        )
       )
     }
 
@@ -384,12 +743,27 @@ window.__ModuleLoader__.load({
       .dsh-drop-status {
         position: fixed; bottom: 110px; left: 50%; transform: translateX(-50%);
         z-index: 9998; pointer-events: none;
-        max-width: 70vw; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        display: inline-flex; align-items: center; gap: 8px;
+        max-width: 70vw;
         font-size: 12px; line-height: 1.5; color: #dce1e8;
         background: rgba(20, 22, 28, 0.85); border: 1px solid rgba(255, 255, 255, 0.08);
         border-radius: 999px; padding: 6px 14px;
         box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
         animation: dshDropStatusIn 0.18s ease-out;
+      }
+      .dsh-drop-status-text {
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      .dsh-drop-status-spinner {
+        flex: none;
+        width: 12px; height: 12px;
+        border: 2px solid rgba(255, 255, 255, 0.3);
+        border-top-color: #ffffff;
+        border-radius: 50%;
+        animation: dshDropStatusSpin 0.8s linear infinite;
+      }
+      @keyframes dshDropStatusSpin {
+        to { transform: rotate(360deg); }
       }
       @keyframes dshDropStatusIn {
         from { opacity: 0; transform: translateX(-50%) translateY(6px); }
@@ -409,9 +783,12 @@ window.__ModuleLoader__.load({
       }
     `
 
-    const inject = ['slots']
+    const inject = ['slots', 'workspaces', 'sessions']
 
     function apply(ctx) {
+      // 初始化当前模式（异步读取，默认 upload）
+      readMode().then((m) => { currentMode = m })
+
       ctx.effect(() => {
         const style = document.createElement('style')
         style.dataset.plugin = 'dsh-file-drop'
@@ -426,8 +803,18 @@ window.__ModuleLoader__.load({
       ))
 
       ctx.slots.inject('conversation.input.dock', () => ctx.slots.register(
-        { name: 'conversation.input.dock', id: 'file-drop', order: 30 },
+        {
+          name: 'conversation.input.dock',
+          id: 'file-drop',
+          order: 30,
+          inject: () => ({ workspaces: ctx.workspaces, sessions: ctx.sessions }),
+        },
         (props) => React.createElement(DropZone, props)
+      ))
+
+      ctx.slots.inject('settings.section', () => ctx.slots.register(
+        { name: 'settings.section', id: 'dsh-file-drop', order: 110, label: () => '拖拽文件' },
+        (props) => React.createElement(SettingsSection, props)
       ))
     }
 
