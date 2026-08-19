@@ -551,6 +551,21 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // 定位中才挂载：监听草稿变化，草稿框渲染出路径后清除「正在定位」提示。
+    // 不定位时不渲染此组件，因此平时完全不监听草稿。
+    function DraftWatcher(props) {
+      const prevDraftRef = React.useRef((props.input && props.input.draft) || '')
+      React.useEffect(() => {
+        const currentDraft = (props.input && props.input.draft) || ''
+        const prev = prevDraftRef.current
+        prevDraftRef.current = currentDraft
+        if (currentDraft !== prev) {
+          statusStore.clear()
+        }
+      }, [props.input && props.input.draft])
+      return null
+    }
+
     // 输入框上方 dock：拖拽监听 + 浮层 + 状态条
     function DropZone(props) {
       const [drag, setDrag] = React.useState(false)
@@ -599,17 +614,6 @@ window.__ModuleLoader__.load({
           window.removeEventListener('scroll', position, true)
         }
       }, [])
-
-      // 草稿框渲染出路径后，清除「正在定位」提示
-      const prevDraftRef = React.useRef((props.input && props.input.draft) || '')
-      React.useEffect(() => {
-        const currentDraft = (props.input && props.input.draft) || ''
-        const prev = prevDraftRef.current
-        prevDraftRef.current = currentDraft
-        if (currentDraft !== prev && statusText && statusText.indexOf('正在') === 0) {
-          statusStore.clear()
-        }
-      }, [props.input && props.input.draft, statusText])
 
       React.useEffect(() => {
         // 全部挂在 window 捕获阶段：事件流的第一个节点，先于 DSH 自带的
@@ -710,6 +714,7 @@ window.__ModuleLoader__.load({
           statusText.indexOf('正在') === 0 ? React.createElement('span', { className: 'dsh-drop-status-spinner' }) : null,
           React.createElement('span', { className: 'dsh-drop-status-text' }, statusText)
         ) : null,
+        currentMode === 'locate' && statusText && statusText.indexOf('正在') === 0 ? React.createElement(DraftWatcher, { input: props.input }) : null,
         drag ? React.createElement('div', { className: 'dsh-drop-overlay' },
           React.createElement('div', { className: 'dsh-drop-overlay-inner' }, '松开鼠标，获取文件')
         ) : null
