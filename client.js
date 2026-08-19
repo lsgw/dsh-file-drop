@@ -555,6 +555,8 @@ window.__ModuleLoader__.load({
     function DropZone(props) {
       const [drag, setDrag] = React.useState(false)
       const statusText = useStatus()
+      const [statusBottom, setStatusBottom] = React.useState(110)
+      const [statusLeft, setStatusLeft] = React.useState('50%')
       const depthRef = React.useRef(0)
       const busyRef = React.useRef(false)
       const optsRef = React.useRef({})
@@ -571,6 +573,32 @@ window.__ModuleLoader__.load({
           } catch { return undefined }
         })(),
       }
+
+      // 让状态提示跟随 composer 输入框：动态定位到输入框上方
+      React.useLayoutEffect(() => {
+        const position = () => {
+          const card = document.querySelector('[data-composer-card]')
+          if (card instanceof HTMLElement) {
+            const rect = card.getBoundingClientRect()
+            setStatusBottom(Math.max(8, window.innerHeight - rect.top + 8))
+            setStatusLeft(rect.left + rect.width / 2)
+          }
+        }
+        let observer
+        const card = document.querySelector('[data-composer-card]')
+        if (card instanceof HTMLElement && typeof ResizeObserver !== 'undefined') {
+          observer = new ResizeObserver(position)
+          observer.observe(card)
+        }
+        position()
+        window.addEventListener('resize', position)
+        window.addEventListener('scroll', position, true)
+        return () => {
+          if (observer) observer.disconnect()
+          window.removeEventListener('resize', position)
+          window.removeEventListener('scroll', position, true)
+        }
+      }, [])
 
       React.useEffect(() => {
         // 全部挂在 window 捕获阶段：事件流的第一个节点，先于 DSH 自带的
@@ -667,7 +695,7 @@ window.__ModuleLoader__.load({
       }
 
       return React.createElement(React.Fragment, null,
-        statusText ? React.createElement('div', { className: 'dsh-drop-status' },
+        statusText ? React.createElement('div', { className: 'dsh-drop-status', style: { bottom: statusBottom, left: statusLeft } },
           statusText.indexOf('正在') === 0 ? React.createElement('span', { className: 'dsh-drop-status-spinner' }) : null,
           React.createElement('span', { className: 'dsh-drop-status-text' }, statusText)
         ) : null,
@@ -741,7 +769,7 @@ window.__ModuleLoader__.load({
         background: var(--dsw-alias-interactive-bg-hover-solid, rgba(128, 128, 128, 0.24));
       }
       .dsh-drop-status {
-        position: fixed; bottom: 110px; left: 50%; transform: translateX(-50%);
+        position: fixed; bottom: 110px; transform: translateX(-50%);
         z-index: 9998; pointer-events: none;
         display: inline-flex; align-items: center; gap: 8px;
         max-width: 70vw;
