@@ -204,11 +204,36 @@ window.__ModuleLoader__.load({
       return value
     }
 
-    function appendToDraft(inputActions, draft, paths) {
+    // ---- 光标处插入（零跟踪：坐标直接读 textarea 的 DOM 原生 selection） ----
+
+    // composer 的 textarea 是真实原生 <textarea>，父容器稳定锚点 [data-input-scroll]；
+    // selectionStart/selectionEnd 失焦后由浏览器保留最近一次值，无需插件自己跟踪。
+    function composerTextarea() {
+      return document.querySelector('[data-input-scroll] textarea')
+    }
+
+    function insertPaths(inputActions, draft, paths) {
       if (!inputActions) return
-      const lines = paths.map((p) => '`' + p + '`')
-      const sep = draft === '' ? '' : ' '
-      inputActions.setDraft(draft + sep + lines.join(' '))
+      const insert = paths.map((p) => '`' + p + '`').join(' ')
+      // 聚焦时读到当前光标；未聚焦时读到 DOM 原生保留的上次光标位置。
+      // 唯一盲区：从未聚焦过的 textarea 恒为 0，空草稿下与插入末尾等价。
+      const el = composerTextarea()
+      const start = el ? (el.selectionStart ?? draft.length) : draft.length
+      const end = el ? (el.selectionEnd ?? start) : start
+      const before = draft.slice(0, start)
+      const after = draft.slice(end)
+      const sepB = (before === '' || /[\s]$/.test(before)) ? '' : ' '
+      const sepA = (after === '' || /^[\s]/.test(after)) ? '' : ' '
+      const next = before + sepB + insert + sepA + after
+      inputActions.setDraft(next)
+      // React 受控 textarea：等 value commit 落盘后把光标复位到插入内容之后
+      if (el) {
+        requestAnimationFrame(() => {
+          const pos = start + sepB.length + insert.length
+          el.focus({ preventScroll: true })
+          el.setSelectionRange(pos, pos)
+        })
+      }
     }
 
     // 共用处理：壳路径优先，其余走上传兜底
@@ -223,7 +248,7 @@ window.__ModuleLoader__.load({
         else rest.push(f)
       }
       if (direct.length > 0) {
-        appendToDraft(inputActions, getDraft(), direct)
+        insertPaths(inputActions, getDraft(), direct)
         statusStore.set('✓ 已获取 ' + direct.length + ' 个原始路径（桌面壳）')
       }
       if (rest.length === 0) return
@@ -255,7 +280,7 @@ window.__ModuleLoader__.load({
           errs.push(f.name + '：' + String((err && err.message) || err))
         }
       }
-      if (ok.length > 0) appendToDraft(inputActions, getDraft(), ok)
+      if (ok.length > 0) insertPaths(inputActions, getDraft(), ok)
       const text = [
         ok.length > 0 ? '✓ ' + ok.length + ' 个文件已上传' : '',
         errs.length > 0 ? '✗ ' + errs.join('；') : '',
@@ -300,7 +325,7 @@ window.__ModuleLoader__.load({
         })
         const data = await response.json().catch(() => ({}))
         if (response.ok && data.path) {
-          appendToDraft(inputActions, getDraft(), [data.path])
+          insertPaths(inputActions, getDraft(), [data.path])
           statusStore.set('✓ 目录已上传' + (skipped.length ? '（跳过 ' + skipped.length + ' 个超大文件）' : ''))
         } else {
           statusStore.set('✗ 目录上传失败：' + (data.error || '保存失败'))
@@ -476,7 +501,7 @@ window.__ModuleLoader__.load({
           failures.push(file.name)
         }
       }
-      if (found.length > 0) appendToDraft(inputActions, getDraft(), found)
+      if (found.length > 0) insertPaths(inputActions, getDraft(), found)
       if (failures.length > 0) statusStore.set('✗ 未能定位：' + failures.join('、'))
       // 成功时不在此处清除：由 DropZone 监听草稿变化、在草稿框渲染后清除
     }
@@ -487,12 +512,12 @@ window.__ModuleLoader__.load({
       try {
         const result = await locateDroppedDirectory(entry, workspaces, currentWorkspacePath)
         if (result.status === 'found') {
-          appendToDraft(inputActions, getDraft(), [result.path])
+          insertPaths(inputActions, getDraft(), [result.path])
           // 成功时不在此处清除：由 DropZone 监听草稿变化、在草稿框渲染后清除
         } else if (result.status === 'choose') {
           const picked = choosePathInteractive(entry.name, result.candidates)
           if (picked) {
-            appendToDraft(inputActions, getDraft(), [picked])
+            insertPaths(inputActions, getDraft(), [picked])
             // 成功时不在此处清除：由 DropZone 监听草稿变化、在草稿框渲染后清除
           } else {
             statusStore.set('✗ 未选择目录路径')
@@ -664,7 +689,7 @@ window.__ModuleLoader__.load({
         // 桌面壳（preload 捕获阶段已解析好磁盘原始路径）
         const shellPaths = drainShellPaths()
         if (shellPaths.length > 0) {
-          appendToDraft(optsRef.current.inputActions, optsRef.current.getDraft(), shellPaths)
+          insertPaths(optsRef.current.inputActions, optsRef.current.getDraft(), shellPaths)
           statusStore.set('✓ 已获取 ' + shellPaths.length + ' 个原始路径（桌面壳）')
           return
         }
@@ -672,7 +697,7 @@ window.__ModuleLoader__.load({
         // 拖拽自带路径 → 直接取地址，零上传
         const paths = extractPaths(e)
         if (paths.length > 0) {
-          appendToDraft(optsRef.current.inputActions, optsRef.current.getDraft(), paths)
+          insertPaths(optsRef.current.inputActions, optsRef.current.getDraft(), paths)
           statusStore.set('✓ 已获取 ' + paths.length + ' 个文件路径')
           return
         }
