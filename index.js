@@ -3,7 +3,7 @@
 // - text：直接写 UTF-8 内容
 // - binary：接收 base64，解码后写真实字节（node fs 原生能力，无需 subprocess）
 // 落盘位置：会话工作区 .dsh-drops/，无会话时回退 $DSH_HOME/.dsh-drops
-import { mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
+import { mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, statSync } from 'node:fs'
 import { join, basename } from 'node:path'
 import { homedir } from 'node:os'
 import { locate } from './locate/locator.js'
@@ -239,4 +239,92 @@ export async function apply(ctx) {
       }
     },
   }), 'dsh-file-drop: settings route')
+
+// 递归统计目录占用字节数；目录不存在/不可读返回 -1
+function dirSize(dir) {
+  let total = 0
+  let entries
+  try { entries = readdirSync(dir, { withFileTypes: true }) } catch { return -1 }
+  for (const entry of entries) {
+    try {
+      const st = statSync(join(dir, entry.name))
+      if (st.isDirectory()) total += dirSize(join(dir, entry.name))
+      else total += st.size
+    } catch { /* 忽略单个条目的读取错误 */ }
+  }
+  return total
+}
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: API_PATH + '/clear',
+    handler: async (req, res) => {
+      try {
+        if (!fence(req)) {
+          sendJson(res, 403, { error: '跨源请求被拒绝' })
+          return
+        }
+        if (req.method !== 'POST') {
+          res.writeHead(405, { allow: 'POST', 'content-length': 0 })
+          res.end()
+          return
+        }
+        const payload = await readJsonBody(req, 1024 * 1024)
+        const { sessionId } = payload
+        // 目标目录与上传落盘逻辑一致：优先当前会话工作区，回退 $DSH_HOME
+        let dir
+        const sessions = ctx.sessions
+        if (sessions && sessionId) {
+          const s = sessions.get(String(sessionId))
+          if (s && s.meta && s.meta.cwd) dir = s.meta.cwd
+        }
+        if (!dir) {
+          dir = (process.env.DSH_HOME && process.env.DSH_HOME.trim()) || join(homedir(), '.dsh')
+        }
+        const dropDir = join(dir, '.dsh-drops')
+        // force: 目录不存在时也视为成功（幂等清空）
+        rmSync(dropDir, { recursive: true, force: true })
+        sendJson(res, 200, { path: dropDir, removed: true })
+      } catch (err) {
+        sendJson(res, 500, { error: String(err && err.message || err) })
+      }
+    },
+  }), 'dsh-file-drop: clear route')
+
+  // 查询上传目录（.dsh-drops）的磁盘占用（字节）；目录不存在返回 size: -1
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: API_PATH + '/size',
+    handler: async (req, res) => {
+      try {
+        if (!fence(req)) {
+          sendJson(res, 403, { error: '跨源请求被拒绝' })
+          return
+        }
+        if (req.method !== 'POST') {
+          res.writeHead(405, { allow: 'POST', 'content-length': 0 })
+          res.end()
+          return
+        }
+        const payload = await readJsonBody(req, 1024 * 1024)
+        const { sessionId } = payload
+        // 目标目录与上传落盘逻辑一致：优先当前会话工作区，回退 $DSH_HOME
+        let dir
+        const sessions = ctx.sessions
+        if (sessions && sessionId) {
+          const s = sessions.get(String(sessionId))
+          if (s && s.meta && s.meta.cwd) dir = s.meta.cwd
+        }
+        if (!dir) {
+          dir = (process.env.DSH_HOME && process.env.DSH_HOME.trim()) || join(homedir(), '.dsh')
+        }
+        const dropDir = join(dir, '.dsh-drops')
+        // 目录不存在（-1）对用户语义等价于 0 占用，统一返回 0
+        const size = dirSize(dropDir)
+        sendJson(res, 200, { path: dropDir, size: size < 0 ? 0 : size })
+      } catch (err) {
+        sendJson(res, 500, { error: String(err && err.message || err) })
+      }
+    },
+  }), 'dsh-file-drop: size route')
 }

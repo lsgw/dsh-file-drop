@@ -747,15 +747,93 @@ window.__ModuleLoader__.load({
     }
 
     // 设置页 section：选择拖拽处理方案
+    // 字节数 → 友好格式（B/KB/MB/GB）
+    function formatSize(bytes) {
+      if (bytes == null || bytes < 0) return '未知'
+      if (bytes === 0) return '0 B'
+      const units = ['B', 'KB', 'MB', 'GB']
+      let value = bytes
+      let i = 0
+      while (value >= 1024 && i < units.length - 1) { value /= 1024; i += 1 }
+      return (Number.isInteger(value) ? String(value) : value.toFixed(1)) + ' ' + units[i]
+    }
+
     function SettingsSection(props) {
       const [mode, setMode] = React.useState(currentMode)
+      const [clearing, setClearing] = React.useState(false)
+      const [clearMsg, setClearMsg] = React.useState('')
+      const [size, setSize] = React.useState(null)
       React.useEffect(() => { readMode().then((m) => { currentMode = m; setMode(m) }) }, [])
       const pick = (m) => { currentMode = m; setMode(m); void writeMode(m) }
+      // 拉取 .dsh-drops 磁盘占用（host 递归统计）
+      const loadSize = async () => {
+        try {
+          let sessionId
+          try {
+            const s = props.sessions && props.sessions.list && props.sessions.list.getSnapshot()
+            sessionId = s && s.current
+          } catch { sessionId = undefined }
+          const response = await fetch(API_PATH + '/size', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ sessionId }),
+          })
+          const data = await response.json().catch(() => ({}))
+          setSize(response.ok && typeof data.size === 'number' ? data.size : null)
+        } catch { setSize(null) }
+      }
+      React.useEffect(() => { void loadSize() }, [])
+      // 清空上传目录：删除当前会话工作区（或回退）下的 .dsh-drops
+      const clearDrops = async () => {
+        if (clearing) return
+        setClearing(true)
+        setClearMsg('')
+        try {
+          let sessionId
+          try {
+            const s = props.sessions && props.sessions.list && props.sessions.list.getSnapshot()
+            sessionId = s && s.current
+          } catch { sessionId = undefined }
+          const response = await fetch(API_PATH + '/clear', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ sessionId }),
+          })
+          const data = await response.json().catch(() => ({}))
+          if (response.ok) {
+            setClearMsg('✓ 已清空上传目录')
+            void loadSize()
+          } else {
+            setClearMsg('✗ 清空失败：' + (data.error || 'HTTP ' + response.status))
+          }
+        } catch (err) {
+          setClearMsg('✗ 清空失败：' + String((err && err.message) || err))
+        } finally {
+          setClearing(false)
+        }
+      }
       return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: '10px' } },
         React.createElement('div', { style: { fontWeight: 600 } }, '拖拽文件处理方式'),
         React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
           React.createElement('input', { type: 'radio', name: 'dsh-file-drop-mode', checked: mode === 'upload', onChange: () => pick('upload') }),
           React.createElement('span', null, '上传到工作区（.dsh-drops，稳定可靠）')
+        ),
+        React.createElement('div', { className: 'dsh-clear-row' },
+          React.createElement('button', {
+            type: 'button',
+            className: 'dsh-clear-btn',
+            disabled: clearing,
+            onClick: () => void clearDrops(),
+          },
+            clearing
+              ? React.createElement(React.Fragment, null,
+                  React.createElement('span', { className: 'dsh-clear-spinner', 'aria-hidden': true }),
+                  '删除中...'
+                )
+              : '清空上传目录'
+          ),
+          React.createElement('span', { className: 'dsh-clear-size' }, '当前占用：' + formatSize(size)),
+          clearMsg ? React.createElement('span', { className: 'dsh-clear-msg' }, clearMsg) : null
         ),
         React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
           React.createElement('input', { type: 'radio', name: 'dsh-file-drop-mode', checked: mode === 'locate', onChange: () => pick('locate') }),
@@ -765,6 +843,38 @@ window.__ModuleLoader__.load({
     }
 
     const CSS = `
+      .dsh-clear-row { display: flex; align-items: center; gap: 8px; padding-left: 24px; }
+      .dsh-clear-btn {
+        display: inline-flex; align-items: center; gap: 6px;
+        height: 28px; padding: 0 12px;
+        border: 1px solid var(--dsw-alias-border-l2-darkmode-thin, rgba(255,255,255,0.15));
+        border-radius: 8px;
+        background: var(--dsw-specific-selector, rgba(128,128,128,0.14));
+        color: var(--dsw-alias-label-primary, inherit);
+        font-size: 12px; line-height: 1.4;
+        cursor: pointer; user-select: none;
+      }
+      .dsh-clear-btn:hover:not(:disabled) {
+        background: var(--dsw-alias-interactive-bg-hover-solid, rgba(128,128,128,0.24));
+      }
+      .dsh-clear-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+      .dsh-clear-spinner {
+        flex: none; width: 12px; height: 12px;
+        border: 2px solid rgba(128,128,128,0.35);
+        border-top-color: currentColor;
+        border-radius: 50%;
+        animation: dshClearSpin 0.8s linear infinite;
+      }
+      @keyframes dshClearSpin { to { transform: rotate(360deg); } }
+      .dsh-clear-msg {
+        font-size: 12px; line-height: 1.4;
+        color: var(--dsw-alias-label-secondary, rgba(255,255,255,0.6));
+      }
+      .dsh-clear-size {
+        font-size: 12px; line-height: 1.4;
+        color: var(--dsw-alias-label-secondary, rgba(255,255,255,0.6));
+        min-width: 64px;
+      }
       .dsh-paperclip-wrap {
         position: relative;
         display: inline-flex;
@@ -882,7 +992,13 @@ window.__ModuleLoader__.load({
       ))
 
       ctx.slots.inject('settings.section', () => ctx.slots.register(
-        { name: 'settings.section', id: 'dsh-file-drop', order: 110, label: () => '拖拽文件' },
+        {
+          name: 'settings.section',
+          id: 'dsh-file-drop',
+          order: 110,
+          label: () => '拖拽文件',
+          inject: () => ({ sessions: ctx.sessions }),
+        },
         (props) => React.createElement(SettingsSection, props)
       ))
     }
