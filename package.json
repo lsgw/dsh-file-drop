@@ -13,6 +13,7 @@
   "files": [
     "index.js",
     "client.js",
+    "locate",
     "cordis.patch.yml",
     "dsh.plugin.json"
   ],
