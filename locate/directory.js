@@ -8,7 +8,8 @@ export const DIRECTORY_SAMPLE_FILES = 24
 export function normalizedDirectoryPath(path) {
   const normalized = String(path).normalize('NFC').replaceAll('\\', '/')
   const parts = normalized.split('/')
-  if (normalized.startsWith('/') || parts.some(part => part === '' || part === '.' || part === '..')) {
+  if (normalized.startsWith('/') || parts.length > DIRECTORY_MAX_DEPTH
+    || parts.some(part => part === '' || part === '.' || part === '..')) {
     throw new TypeError('invalid directory-relative path')
   }
   return normalized

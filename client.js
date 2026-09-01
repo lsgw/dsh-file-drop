@@ -26,26 +26,79 @@ window.__ModuleLoader__.load({
       'application/sql', 'application/x-sh', 'application/x-httpd-php', 'application/ecmascript',
     ])
     const MAX_BYTES = 25 * 1024 * 1024
+    const MAX_TOP_LEVEL_FILES = 500
+    const MAX_DIRECTORY_BYTES = 64 * 1024 * 1024
+    const MAX_DIRECTORY_ENTRIES = 10000
+    const MAX_ROOT_DIRECTORIES = 32
     const API_PATH = '/api/dsh-file-drop'
     const SETTINGS_PATH = API_PATH + '/settings'
     let currentMode = 'upload'
+    let uploadProtocolVersion = 1
+    let uploadProtocolKnown = false
+    let capabilityRefresh
+    let modeRevision = 0
+    let modeWriteQueue = Promise.resolve()
+    const activeControllers = new Set()
+    const claimedDropEvents = new WeakSet()
+    const dropOwners = new Set()
 
-    async function readMode() {
-      try {
-        const res = await fetch(SETTINGS_PATH)
-        const data = await res.json().catch(() => ({}))
-        return data.mode === 'locate' ? 'locate' : 'upload'
-      } catch { return 'upload' }
+    function throwIfAborted(signal) {
+      if (signal && signal.aborted) throw new DOMException('操作已取消', 'AbortError')
     }
 
-    async function writeMode(mode) {
+    function operationController() {
+      const controller = new AbortController()
+      activeControllers.add(controller)
+      return {
+        controller,
+        release: () => activeControllers.delete(controller),
+      }
+    }
+
+    function abortActiveOperations() {
+      for (const controller of activeControllers) controller.abort()
+      activeControllers.clear()
+    }
+
+    async function readMode(signal) {
       try {
-        await fetch(SETTINGS_PATH, {
+        const res = await fetch(SETTINGS_PATH, { signal })
+        if (!res.ok) throw new Error('settings HTTP ' + res.status)
+        const data = await res.json()
+        uploadProtocolVersion = Number.isSafeInteger(data.uploadProtocolVersion)
+          && data.uploadProtocolVersion >= 2 ? data.uploadProtocolVersion : 1
+        uploadProtocolKnown = true
+        return data.mode === 'locate' ? 'locate' : 'upload'
+      } catch {
+        uploadProtocolVersion = 1
+        uploadProtocolKnown = false
+        return 'upload'
+      }
+    }
+
+    function refreshSettings() {
+      if (!capabilityRefresh) {
+        capabilityRefresh = readMode().finally(() => { capabilityRefresh = undefined })
+      }
+      return capabilityRefresh
+    }
+
+    async function refreshUploadCapability(signal) {
+      await abortableCallback(signal, (resolve, reject) => refreshSettings().then(resolve, reject))
+      return uploadProtocolKnown
+    }
+
+    function writeMode(mode) {
+      const persist = async () => {
+        const response = await fetch(SETTINGS_PATH, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ mode }),
         })
-      } catch { /* ignore */ }
+        if (!response.ok) throw new Error('保存拖拽模式失败（HTTP ' + response.status + '）')
+      }
+      modeWriteQueue = modeWriteQueue.catch(() => {}).then(persist)
+      return modeWriteQueue
     }
 
     // ---- 文件识别与读取 ----
@@ -58,23 +111,35 @@ window.__ModuleLoader__.load({
       return TEXT_EXT.has(file.name.slice(dot + 1).toLowerCase())
     }
 
-    function fileToBase64(file) {
-      return new Promise((resolve, reject) => {
-        const reader = new FileReader()
-        reader.onerror = () => reject(reader.error || new Error('读取文件失败'))
-        reader.onload = () => {
-          try {
-            const bytes = new Uint8Array(reader.result)
-            let bin = ''
-            const CHUNK = 0x8000
-            for (let i = 0; i < bytes.length; i += CHUNK) {
-              bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK))
-            }
-            resolve(btoa(bin))
-          } catch (e) { reject(e) }
-        }
-        reader.readAsArrayBuffer(file)
-      })
+    function bytesToBase64(bytes, signal) {
+      let binary = ''
+      const chunkSize = 0x8000
+      for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+        throwIfAborted(signal)
+        binary += String.fromCharCode.apply(null, bytes.subarray(offset, offset + chunkSize))
+      }
+      return btoa(binary)
+    }
+
+    function sameBytes(left, right) {
+      if (left.length !== right.length) return false
+      for (let index = 0; index < left.length; index += 1) {
+        if (left[index] !== right[index]) return false
+      }
+      return true
+    }
+
+    async function uploadPayload(file, signal) {
+      throwIfAborted(signal)
+      const bytes = new Uint8Array(await file.arrayBuffer())
+      throwIfAborted(signal)
+      if (looksText(file)) {
+        try {
+          const content = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes)
+          if (sameBytes(new TextEncoder().encode(content), bytes)) return { kind: 'text', content }
+        } catch { /* 非法 UTF-8 必须按二进制保留原始字节。 */ }
+      }
+      return { kind: 'binary', base64: bytesToBase64(bytes, signal) }
     }
 
     // ---- 桌面壳 ----
@@ -103,6 +168,22 @@ window.__ModuleLoader__.load({
       return null
     }
 
+    function fileUriToPath(value) {
+      try {
+        const url = new URL(value)
+        if (url.protocol !== 'file:') return null
+        const host = decodeURIComponent(url.hostname)
+        let path = decodeURIComponent(url.pathname)
+        const windowsDrive = /^\/[A-Za-z]:\//.test(path)
+        if (windowsDrive) path = path.slice(1)
+        if (host && host.toLowerCase() !== 'localhost') path = '//' + host + path
+        if (windowsDrive || /^Win/i.test(navigator.platform || '')) {
+          path = path.replaceAll('/', '\\')
+        }
+        return path || null
+      } catch { return null }
+    }
+
     // 拖拽自带路径（Obsidian / 文件管理器拖拽常带 uri-list）
     function extractPaths(e) {
       const paths = []
@@ -111,10 +192,9 @@ window.__ModuleLoader__.load({
         for (const line of uris) {
           const t = line.trim()
           if (!t || t.startsWith('#')) continue
-          if (t.startsWith('file://')) {
-            try {
-              paths.push(decodeURIComponent(t.slice('file://'.length).replace(/^localhost/, '')))
-            } catch { paths.push(t.slice(7)) }
+          if (/^file:\/\//i.test(t)) {
+            const path = fileUriToPath(t)
+            if (path) paths.push(path)
           } else if (t.startsWith('/')) {
             paths.push(t)
           }
@@ -123,39 +203,93 @@ window.__ModuleLoader__.load({
       if (paths.length === 0) {
         try {
           const plain = (e.dataTransfer.getData('text/plain') || '').trim()
-          if (plain && (plain.startsWith('/') || /^[A-Za-z]:[\\/]/.test(plain)) && !plain.includes('\n')) {
+          if (plain && (plain.startsWith('/') || /^\\\\[^\\]/.test(plain) || /^[A-Za-z]:[\\/]/.test(plain)) && !plain.includes('\n')) {
             paths.push(plain)
           }
         } catch { /* 忽略 */ }
       }
-      return paths
+      return [...new Set(paths)]
     }
 
     // ---- 目录遍历（webkitGetAsEntry，upload 与 locate 共用） ----
 
-    function readEntryAll(entry) {
+    function abortableCallback(signal, start) {
       return new Promise((resolve, reject) => {
-        if (entry.isFile) {
-          entry.file((file) => resolve([{ path: '', file }]), reject)
-          return
+        let settled = false
+        const finish = (callback, value) => {
+          if (settled) return
+          settled = true
+          if (signal) signal.removeEventListener('abort', onAbort)
+          callback(value)
         }
-        if (!entry.isDirectory) { resolve([]); return }
-        const reader = entry.createReader()
-        const out = []
-        const readBatch = () => {
-          reader.readEntries(async (children) => {
-            if (!children || children.length === 0) { resolve(out); return }
-            try {
-              const results = await Promise.all(children.map((child) => readEntryAll(child)))
-              children.forEach((child, i) => {
-                for (const s of results[i]) out.push({ path: child.name + (s.path ? '/' + s.path : ''), file: s.file })
-              })
-              readBatch()
-            } catch (err) { reject(err) }
-          }, reject)
-        }
-        readBatch()
+        const onAbort = () => finish(reject, new DOMException('操作已取消', 'AbortError'))
+        if (signal && signal.aborted) { onAbort(); return }
+        if (signal) signal.addEventListener('abort', onAbort, { once: true })
+        try { start((value) => finish(resolve, value), (error) => finish(reject, error)) }
+        catch (error) { finish(reject, error) }
       })
+    }
+
+    function abortableDelay(milliseconds, signal) {
+      return new Promise((resolve, reject) => {
+        const onAbort = () => {
+          clearTimeout(timer)
+          reject(new DOMException('操作已取消', 'AbortError'))
+        }
+        if (signal && signal.aborted) { reject(new DOMException('操作已取消', 'AbortError')); return }
+        const timer = setTimeout(() => {
+          if (signal) signal.removeEventListener('abort', onAbort)
+          resolve()
+        }, milliseconds)
+        if (signal) signal.addEventListener('abort', onAbort, { once: true })
+      })
+    }
+
+    async function readEntryAll(entry, limit = Number.POSITIVE_INFINITY, state = { count: 0 }, signal,
+      includeDirectory = false, entryLimit = Number.POSITIVE_INFINITY) {
+      if (!Number.isSafeInteger(state.entries)) state.entries = 0
+      throwIfAborted(signal)
+      if (state.count >= limit || state.entries >= entryLimit) return []
+      if (entry.isFile) {
+        const file = await abortableCallback(signal, (resolve, reject) => entry.file(resolve, reject))
+        throwIfAborted(signal)
+        if (state.count >= limit || state.entries >= entryLimit) return []
+        state.count += 1
+        state.entries += 1
+        return [{ path: '', kind: 'file', file }]
+      }
+      if (!entry.isDirectory) return []
+      const reader = entry.createReader()
+      const out = []
+      if (includeDirectory) {
+        state.entries += 1
+        out.push({ path: '', kind: 'directory' })
+      }
+      while (state.count < limit && state.entries < entryLimit) {
+        const children = await abortableCallback(signal, (resolve, reject) => reader.readEntries(resolve, reject))
+        throwIfAborted(signal)
+        if (!children || children.length === 0) break
+        for (const child of children) {
+          throwIfAborted(signal)
+          if (state.count >= limit || state.entries >= entryLimit) break
+          const results = await readEntryAll(child, limit, state, signal, true, entryLimit)
+          for (const result of results) {
+            out.push({ ...result, path: child.name + (result.path ? '/' + result.path : '') })
+          }
+        }
+      }
+      return out
+    }
+
+    function shouldHandleDataTransfer(dataTransfer) {
+      if (!dataTransfer || !Array.from(dataTransfer.types || []).includes('Files')) return false
+      const fileItems = Array.from(dataTransfer.items || []).filter((item) => item && item.kind === 'file')
+      if (fileItems.length > 0) {
+        return fileItems.some((item) => !item.type || !item.type.toLowerCase().startsWith('image/'))
+      }
+      const files = Array.from(dataTransfer.files || [])
+      if (files.length > 0) return files.some((file) => !file.type || !file.type.toLowerCase().startsWith('image/'))
+      return true
     }
 
     function getDirectoryEntries(items) {
@@ -164,7 +298,10 @@ window.__ModuleLoader__.load({
       for (const item of items) {
         try {
           const entry = item.webkitGetAsEntry && item.webkitGetAsEntry()
-          if (entry && entry.isDirectory) dirs.push(entry)
+          if (entry && entry.isDirectory) {
+            dirs.push(entry)
+            if (dirs.length > MAX_ROOT_DIRECTORIES) break
+          }
         } catch { /* 忽略 */ }
       }
       return dirs
@@ -172,25 +309,58 @@ window.__ModuleLoader__.load({
 
     // ---- 共享状态（按钮上传与拖拽共用一个状态条） ----
 
+    const STATUS_DISMISS_MS = 3500
     const statusStore = {
       value: null,
       listeners: new Set(),
       timer: null,
-      set(text) {
-        if (currentMode === 'upload') return
-        this.value = text
-        for (const l of [...this.listeners]) l()
+      generation: 0,
+      revision: 0,
+      notify() {
+        for (const listener of [...this.listeners]) listener()
+      },
+      set(text, { autoDismiss = true } = {}) {
         if (this.timer) clearTimeout(this.timer)
+        this.timer = null
+        const revision = ++this.revision
+        this.value = text
+        this.notify()
+        if (!autoDismiss) return true
         this.timer = setTimeout(() => {
+          if (revision !== this.revision) return
+          this.timer = null
           this.value = null
-          for (const l of [...this.listeners]) l()
-        }, 3500)
+          this.notify()
+        }, STATUS_DISMISS_MS)
+        return true
+      },
+      show(text) {
+        this.generation += 1
+        return this.set(text)
+      },
+      begin(text) {
+        const token = ++this.generation
+        this.set(text, { autoDismiss: false })
+        return token
+      },
+      update(token, text) {
+        if (token !== this.generation) return false
+        return this.set(text, { autoDismiss: false })
+      },
+      finish(token, text) {
+        if (token !== this.generation) return false
+        return this.set(text)
+      },
+      cancel(token) {
+        if (token === this.generation) this.clear()
       },
       clear() {
+        this.generation += 1
+        this.revision += 1
         if (this.timer) clearTimeout(this.timer)
         this.timer = null
         this.value = null
-        for (const l of [...this.listeners]) l()
+        this.notify()
       },
       subscribe(fn) {
         this.listeners.add(fn)
@@ -199,36 +369,59 @@ window.__ModuleLoader__.load({
     }
 
     function useStatus() {
-      const [value, setValue] = React.useState(statusStore.value)
-      React.useEffect(() => statusStore.subscribe(() => setValue(statusStore.value)), [])
-      return value
+      return React.useSyncExternalStore(
+        (listener) => statusStore.subscribe(listener),
+        () => statusStore.value,
+        () => statusStore.value
+      )
     }
 
     // ---- 光标处插入（零跟踪：坐标直接读 textarea 的 DOM 原生 selection） ----
 
     // composer 的 textarea 是真实原生 <textarea>，父容器稳定锚点 [data-input-scroll]；
     // selectionStart/selectionEnd 失焦后由浏览器保留最近一次值，无需插件自己跟踪。
-    function composerTextarea() {
-      return document.querySelector('[data-input-scroll] textarea')
+    function composerTextarea(draft) {
+      const all = [...document.querySelectorAll('[data-input-scroll] textarea')]
+      const visible = all.filter((el) => el.isConnected && el.getClientRects().length > 0)
+      if (visible.includes(document.activeElement)) return document.activeElement
+      const matching = visible.filter((el) => el.value === draft)
+      return matching.at(-1) || visible.at(-1) || all.at(-1) || null
     }
 
-    function insertPaths(inputActions, draft, paths) {
-      if (!inputActions) return
-      const insert = paths.map((p) => '`' + p + '`').join(' ')
+    function summarizeItems(items, separator = '；', limit = 8) {
+      const visible = items.slice(0, limit).join(separator)
+      return items.length > limit ? visible + separator + '另有 ' + (items.length - limit) + ' 项' : visible
+    }
+
+    function markdownPath(path) {
+      const text = String(path)
+      const maxRun = Math.max(0, ...(text.match(/`+/g) || []).map((run) => run.length))
+      const fence = '`'.repeat(maxRun + 1)
+      const padding = text.startsWith('`') || text.endsWith('`') ? ' ' : ''
+      return fence + padding + text + padding + fence
+    }
+
+    function insertPaths(inputActions, draft, paths, isActive = () => true) {
+      if (!inputActions || !isActive()) return
+      const fallbackDraft = typeof draft === 'string' ? draft : ''
+      const insert = paths.map(markdownPath).join(' ')
       // 聚焦时读到当前光标；未聚焦时读到 DOM 原生保留的上次光标位置。
       // 唯一盲区：从未聚焦过的 textarea 恒为 0，空草稿下与插入末尾等价。
-      const el = composerTextarea()
-      const start = el ? (el.selectionStart ?? draft.length) : draft.length
-      const end = el ? (el.selectionEnd ?? start) : start
-      const before = draft.slice(0, start)
-      const after = draft.slice(end)
+      const el = composerTextarea(fallbackDraft)
+      const currentDraft = el ? el.value : fallbackDraft
+      const start = Math.min(el ? (el.selectionStart ?? currentDraft.length) : currentDraft.length, currentDraft.length)
+      const end = Math.min(el ? (el.selectionEnd ?? start) : start, currentDraft.length)
+      const before = currentDraft.slice(0, start)
+      const after = currentDraft.slice(end)
       const sepB = (before === '' || /[\s]$/.test(before)) ? '' : ' '
       const sepA = (after === '' || /^[\s]/.test(after)) ? '' : ' '
       const next = before + sepB + insert + sepA + after
+      if (!isActive()) return
       inputActions.setDraft(next)
       // React 受控 textarea：等 value commit 落盘后把光标复位到插入内容之后
       if (el) {
         requestAnimationFrame(() => {
+          if (!isActive() || !el.isConnected) return
           const pos = start + sepB.length + insert.length
           el.focus({ preventScroll: true })
           el.setSelectionRange(pos, pos)
@@ -239,29 +432,35 @@ window.__ModuleLoader__.load({
     // 共用处理：壳路径优先，其余走上传兜底
     async function processFiles(files, opts) {
       if (!files.length) return
-      const { sessionId, inputActions, getDraft } = opts
+      if (files.length > MAX_TOP_LEVEL_FILES) {
+        statusStore.show('✗ 一次最多处理 ' + MAX_TOP_LEVEL_FILES + ' 个文件')
+        return
+      }
+      const { sessionId, inputActions, getDraft, signal } = opts
+      const isActive = typeof opts.isActive === 'function' ? opts.isActive : () => true
       const direct = []
       const rest = []
       for (const f of files) {
-        const p = shellPathOf(f)
-        if (p) direct.push(p)
+        const path = shellPathOf(f)
+        if (path) direct.push(path)
         else rest.push(f)
       }
+      if (!isActive()) return
       if (direct.length > 0) {
-        insertPaths(inputActions, getDraft(), direct)
-        statusStore.set('✓ 已获取 ' + direct.length + ' 个原始路径（桌面壳）')
+        insertPaths(inputActions, getDraft(), direct, isActive)
+        statusStore.show('✓ 已获取 ' + direct.length + ' 个原始路径（桌面壳）')
       }
       if (rest.length === 0) return
 
-      statusStore.set('正在上传 ' + rest.length + ' 个文件…')
+      const statusToken = statusStore.begin('正在上传 ' + rest.length + ' 个文件…')
       const ok = []
       const errs = []
       for (const f of rest) {
+        if (!isActive()) { statusStore.cancel(statusToken); return }
         if (f.size > MAX_BYTES) { errs.push(f.name + '（超过 25MB 限制）'); continue }
         try {
-          const payload = looksText(f)
-            ? { kind: 'text', content: await f.text() }
-            : { kind: 'binary', base64: await fileToBase64(f) }
+          const payload = await uploadPayload(f, signal)
+          if (!isActive()) { statusStore.cancel(statusToken); return }
           const response = await fetch(API_PATH, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
@@ -272,73 +471,128 @@ window.__ModuleLoader__.load({
               type: f.type || '',
               ...payload,
             }),
+            signal,
           })
+          if (!isActive()) { statusStore.cancel(statusToken); return }
           const data = await response.json().catch(() => ({}))
+          if (!isActive()) { statusStore.cancel(statusToken); return }
           if (response.ok && data.path) ok.push(data.path)
           else errs.push(f.name + '：' + (data.error || '保存失败'))
         } catch (err) {
+          if (!isActive()) { statusStore.cancel(statusToken); return }
           errs.push(f.name + '：' + String((err && err.message) || err))
         }
       }
-      if (ok.length > 0) insertPaths(inputActions, getDraft(), ok)
+      if (!isActive()) { statusStore.cancel(statusToken); return }
+      if (ok.length > 0) insertPaths(inputActions, getDraft(), ok, isActive)
       const text = [
         ok.length > 0 ? '✓ ' + ok.length + ' 个文件已上传' : '',
-        errs.length > 0 ? '✗ ' + errs.join('；') : '',
+        errs.length > 0 ? '✗ ' + summarizeItems(errs) : '',
       ].filter(Boolean).join('　')
-      statusStore.set(text || '没有文件被处理')
+      statusStore.finish(statusToken, text || '没有文件被处理')
     }
 
     // 目录：递归遍历后整包上传，落盘为同名目录，插入目录根路径（upload 方案）
     async function processDirectoryUpload(entry, opts) {
-      const { sessionId, inputActions, getDraft } = opts
+      const { sessionId, inputActions, getDraft, signal } = opts
+      const isActive = typeof opts.isActive === 'function' ? opts.isActive : () => true
       const MAX_DIR_FILES = 500
-      statusStore.set('正在读取目录 ' + entry.name + ' …')
+      const statusToken = statusStore.begin('正在读取目录 ' + entry.name + ' …')
       let all
       try {
-        all = await readEntryAll(entry)
+        all = await readEntryAll(
+          entry,
+          MAX_DIR_FILES + 1,
+          { count: 0, entries: 0 },
+          signal,
+          false,
+          MAX_DIRECTORY_ENTRIES + 1
+        )
       } catch (err) {
-        statusStore.set('✗ 读取目录失败：' + String((err && err.message) || err))
+        if (!isActive()) { statusStore.cancel(statusToken); return }
+        statusStore.finish(statusToken, '✗ 读取目录失败：' + String((err && err.message) || err))
         return
       }
-      if (all.length > MAX_DIR_FILES) {
-        all = all.slice(0, MAX_DIR_FILES)
+      if (!isActive()) { statusStore.cancel(statusToken); return }
+      const fileRecords = all.filter((record) => record.kind === 'file')
+      if (fileRecords.length > MAX_DIR_FILES) {
+        statusStore.finish(statusToken, '✗ 目录超过 ' + MAX_DIR_FILES + ' 个文件限制，未上传任何内容')
+        return
+      }
+      if (all.length > MAX_DIRECTORY_ENTRIES) {
+        statusStore.finish(statusToken, '✗ 目录超过 ' + MAX_DIRECTORY_ENTRIES + ' 个条目限制，未上传任何内容')
+        return
+      }
+      if (all.some((record) => record.kind === 'directory')) {
+        const capabilityKnown = await refreshUploadCapability(signal)
+        if (!isActive()) { statusStore.cancel(statusToken); return }
+        if (!capabilityKnown) {
+          statusStore.finish(statusToken, '✗ 无法确认 Host 目录协议，未上传以避免丢失空子目录')
+          return
+        }
       }
       const entries = []
       const skipped = []
-      for (const { path, file } of all) {
+      let totalBytes = 0
+      for (const record of all) {
+        if (!isActive()) { statusStore.cancel(statusToken); return }
+        if (record.kind === 'directory') {
+          if (uploadProtocolVersion >= 2) entries.push({ kind: 'directory', path: record.path })
+          continue
+        }
+        const { path, file } = record
         if (file.size > MAX_BYTES) { skipped.push(file.name); continue }
-        const payload = looksText(file)
-          ? { kind: 'text', content: await file.text() }
-          : { kind: 'binary', base64: await fileToBase64(file) }
-        entries.push({ path: path || file.name, ...payload })
+        totalBytes += file.size
+        if (totalBytes > MAX_DIRECTORY_BYTES) {
+          statusStore.finish(statusToken, '✗ 目录可上传文件总大小超过 64MB，未上传任何内容')
+          return
+        }
+        try {
+          const payload = await uploadPayload(file, signal)
+          if (!isActive()) { statusStore.cancel(statusToken); return }
+          entries.push({ path: path || file.name, size: file.size, ...payload })
+        } catch {
+          if (!isActive()) { statusStore.cancel(statusToken); return }
+          skipped.push(file.name)
+        }
       }
-      if (entries.length === 0) {
-        statusStore.set('✗ 目录内没有可上传的文件' + (skipped.length ? '（跳过 ' + skipped.length + ' 个超大文件）' : ''))
+      if (entries.length === 0 && skipped.length > 0) {
+        statusStore.finish(statusToken, '✗ 目录内没有可上传的文件（跳过 ' + skipped.length + ' 个文件）')
         return
       }
-      statusStore.set('正在上传目录 ' + entry.name + '（' + entries.length + ' 个文件）…')
+      const uploadFileCount = entries.filter((item) => item.kind !== 'directory').length
+      statusStore.update(statusToken, '正在上传目录 ' + entry.name + '（' + uploadFileCount + ' 个文件）…')
       try {
         const response = await fetch(API_PATH + '/dir', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ sessionId, dirName: entry.name, entries }),
+          signal,
         })
+        if (!isActive()) { statusStore.cancel(statusToken); return }
         const data = await response.json().catch(() => ({}))
+        if (!isActive()) { statusStore.cancel(statusToken); return }
         if (response.ok && data.path) {
-          insertPaths(inputActions, getDraft(), [data.path])
-          statusStore.set('✓ 目录已上传' + (skipped.length ? '（跳过 ' + skipped.length + ' 个超大文件）' : ''))
+          insertPaths(inputActions, getDraft(), [data.path], isActive)
+          const cleanupNote = data.cleanupError
+            ? '；旧版本目录清理失败：' + data.cleanupError
+            : data.cleanupPending ? '；旧版本目录正在后台清理' : ''
+          statusStore.finish(statusToken, '✓ 目录已上传' + (skipped.length ? '（跳过 ' + skipped.length + ' 个文件）' : '') + cleanupNote)
         } else {
-          statusStore.set('✗ 目录上传失败：' + (data.error || '保存失败'))
+          statusStore.finish(statusToken, '✗ 目录上传失败：' + (data.error || '保存失败'))
         }
       } catch (err) {
-        statusStore.set('✗ 目录上传失败：' + String((err && err.message) || err))
+        if (!isActive()) { statusStore.cancel(statusToken); return }
+        statusStore.finish(statusToken, '✗ 目录上传失败：' + String((err && err.message) || err))
       }
     }
 
     // ---- locate 方案（搜索定位，零拷贝） ----
 
     const LOCATE_ROUTE = '/file-drop/locate'
+    const LOCATE_PROTOCOL_VERSION = 2
     const LOCATE_SAMPLE_BYTES = 64 * 1024
+    const LOCATE_FULL_MAX_BYTES = 8 * 1024 * 1024
     const LOCATE_MAX_DEPTH = 32
     const LOCATE_MAX_ENTRIES = 10000
 
@@ -356,9 +610,11 @@ window.__ModuleLoader__.load({
       return starts.map((start) => ({ start, end: Math.min(start + LOCATE_SAMPLE_BYTES, size) }))
     }
 
-    async function fileSampleFingerprint(file) {
+    async function fileSampleFingerprint(file, signal) {
+      throwIfAborted(signal)
       const ranges = locateSampleRanges(file.size)
       const parts = await Promise.all(ranges.map((r) => file.slice(r.start, r.end).arrayBuffer()))
+      throwIfAborted(signal)
       const total = parts.reduce((sum, part) => sum + part.byteLength, 8)
       const combined = new Uint8Array(total)
       new DataView(combined.buffer).setBigUint64(0, BigInt(file.size))
@@ -367,53 +623,60 @@ window.__ModuleLoader__.load({
         combined.set(new Uint8Array(part), cursor)
         cursor += part.byteLength
       }
-      return hexFromArrayBuffer(await crypto.subtle.digest('SHA-256', combined))
+      const digest = await crypto.subtle.digest('SHA-256', combined)
+      throwIfAborted(signal)
+      return hexFromArrayBuffer(digest)
     }
 
-    async function fileFullFingerprint(file) {
-      return hexFromArrayBuffer(await crypto.subtle.digest('SHA-256', await file.arrayBuffer()))
+    async function fileFullFingerprint(file, signal) {
+      throwIfAborted(signal)
+      const bytes = await file.arrayBuffer()
+      throwIfAborted(signal)
+      const digest = await crypto.subtle.digest('SHA-256', bytes)
+      throwIfAborted(signal)
+      return hexFromArrayBuffer(digest)
     }
 
-    async function locateRequest(body) {
+    async function locateRequest(body, signal) {
       const response = await fetch(LOCATE_ROUTE, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ ...body, protocolVersion: LOCATE_PROTOCOL_VERSION }),
+        signal,
       })
       const value = await response.json().catch(() => ({}))
       return response.ok ? value : { status: 'error', message: value.message || ('HTTP ' + response.status) }
     }
 
-    function readEntryChildren(entry) {
+    async function readEntryChildren(entry, signal) {
+      throwIfAborted(signal)
       const reader = entry.createReader()
       const out = []
-      return new Promise((resolve, reject) => {
-        const readBatch = () => {
-          reader.readEntries((batch) => {
-            if (!batch || batch.length === 0) { resolve(out); return }
-            out.push(...batch)
-            readBatch()
-          }, reject)
-        }
-        readBatch()
-      })
+      while (true) {
+        const batch = await abortableCallback(signal, (resolve, reject) => reader.readEntries(resolve, reject))
+        throwIfAborted(signal)
+        if (!batch || batch.length === 0) return out
+        out.push(...batch)
+      }
     }
 
-    async function readDirectoryStructure(root) {
+    async function readDirectoryStructure(root, signal) {
       const entries = []
       let truncated = false
       const visit = async (directory, prefix, depth) => {
+        throwIfAborted(signal)
         if (depth >= LOCATE_MAX_DEPTH) { truncated = true; return }
-        const children = await readEntryChildren(directory)
+        const children = await readEntryChildren(directory, signal)
         children.sort((a, b) => a.name.normalize('NFC').localeCompare(b.name.normalize('NFC')))
         for (const child of children) {
+          throwIfAborted(signal)
           if (entries.length >= LOCATE_MAX_ENTRIES) { truncated = true; return }
           const path = prefix === '' ? child.name : prefix + '/' + child.name
           if (child.isDirectory) {
             entries.push({ path, kind: 'directory' })
             await visit(child, path, depth + 1)
           } else if (child.isFile) {
-            const file = await new Promise((resolve, reject) => child.file(resolve, reject))
+            const file = await abortableCallback(signal, (resolve, reject) => child.file(resolve, reject))
             entries.push({ path, kind: 'file', size: file.size })
           }
         }
@@ -422,75 +685,242 @@ window.__ModuleLoader__.load({
       return { entries, truncated }
     }
 
-    async function findEntryByPath(root, relativePath) {
+    async function findEntryByPath(root, relativePath, signal) {
       let current = root
       for (const part of relativePath.split('/')) {
+        throwIfAborted(signal)
         if (!current || !current.isDirectory) return undefined
-        current = (await readEntryChildren(current)).find((entry) => entry.name.normalize('NFC') === part.normalize('NFC'))
+        current = (await readEntryChildren(current, signal)).find((entry) => entry.name.normalize('NFC') === part.normalize('NFC'))
         if (current === undefined) return undefined
       }
       return current
     }
 
-    async function readDirectoryContentSamples(root, paths) {
+    async function readDirectoryContentSamples(root, paths, signal) {
       const samples = []
       for (const path of paths) {
-        const entry = await findEntryByPath(root, path)
+        throwIfAborted(signal)
+        const entry = await findEntryByPath(root, path, signal)
         if (entry && entry.isFile === true) {
-          const file = await new Promise((resolve, reject) => entry.file(resolve, reject))
-          samples.push({ path, size: file.size, digest: await fileSampleFingerprint(file) })
+          const file = await abortableCallback(signal, (resolve, reject) => entry.file(resolve, reject))
+          samples.push({ path, size: file.size, digest: await fileSampleFingerprint(file, signal) })
         }
       }
       return samples
     }
 
-    function workspaceContext(workspaces, currentWorkspacePath) {
+    function normalizeSessionId(value) {
+      return typeof value === 'string' && value.trim() !== '' ? value : undefined
+    }
+
+    function dropOwnerElement(record) {
+      let element = record.ownerRef.current && record.ownerRef.current.parentElement
+      while (element) {
+        const style = getComputedStyle(element)
+        if (style.visibility === 'hidden' || style.display === 'none') return undefined
+        if (element.getClientRects().length > 0) return element
+        element = element.parentElement
+      }
+      return undefined
+    }
+
+    function chooseDropOwner(eligible, containing = [], pointed = [], focused = []) {
+      for (const candidates of [containing, pointed, focused]) {
+        if (candidates.length === 1) return candidates[0]
+      }
+      return eligible.length === 1 ? eligible[0] : undefined
+    }
+
+    function selectDropOwner(event, sessions) {
+      let currentSessionId
+      try {
+        const snapshot = sessions && sessions.list && sessions.list.getSnapshot()
+        currentSessionId = normalizeSessionId(snapshot && snapshot.current)
+      } catch { return undefined }
+      const target = event.target instanceof Element ? event.target : undefined
+      const eligible = [...dropOwners].filter((record) => {
+        if (record.optsRef.current.sessionId !== currentSessionId) return false
+        return dropOwnerElement(record) !== undefined
+      })
+      const containing = target ? eligible.filter((record) => {
+        const element = dropOwnerElement(record)
+        return element && element.contains(target)
+      }) : []
+      const pointed = Number.isFinite(event.clientX) && Number.isFinite(event.clientY)
+        ? eligible.filter((record) => {
+          const rect = dropOwnerElement(record).getBoundingClientRect()
+          return event.clientX >= rect.left && event.clientX <= rect.right
+            && event.clientY >= rect.top && event.clientY <= rect.bottom
+        })
+        : []
+      const active = document.activeElement instanceof Element ? document.activeElement : undefined
+      const focused = active ? eligible.filter((record) => dropOwnerElement(record).contains(active)) : []
+      return chooseDropOwner(eligible, containing, pointed, focused)
+    }
+
+    function currentSessionMatches(sessions, sessionId) {
+      try {
+        const snapshot = sessions && sessions.list && sessions.list.getSnapshot()
+        return normalizeSessionId(snapshot && snapshot.current) === sessionId
+      } catch { return false }
+    }
+
+    function currentSessionWorkspacePath(sessions) {
+      try {
+        const snapshot = sessions && sessions.list && sessions.list.getSnapshot()
+        const id = snapshot && snapshot.current
+        return id === undefined ? undefined : (snapshot.byId[id] && snapshot.byId[id].cwd)
+      } catch { return undefined }
+    }
+
+    function workspaceContext(workspaces, currentWorkspacePath, sessionId) {
+      sessionId = normalizeSessionId(sessionId)
       const items = (workspaces && workspaces.list && workspaces.list.getSnapshot && workspaces.list.getSnapshot().items) || []
       return {
         workspacePaths: items.map((item) => item.path),
         ...(currentWorkspacePath === undefined ? {} : { currentWorkspacePath }),
+        ...(sessionId === undefined ? {} : { sessionId }),
       }
     }
 
-    async function locateDroppedFile(file, workspaces, currentWorkspacePath) {
-      const meta = droppedFileMeta(file)
-      const wctx = workspaceContext(workspaces, currentWorkspacePath)
-      let result = await locateRequest({ phase: 'metadata', file: meta, ...wctx })
-      if (result.status !== 'sample-required') return result
-      result = await locateRequest({ phase: 'sample', file: meta, candidates: result.candidates, digest: await fileSampleFingerprint(file) })
-      if (result.status !== 'full-required') return result
-      return locateRequest({ phase: 'full', file: meta, candidates: result.candidates, digest: await fileFullFingerprint(file) })
+    function workspacePathKey(value) {
+      if (typeof value !== 'string') return ''
+      let path = value.trim()
+      if (/^Win/i.test(navigator.platform || '')) {
+        path = path.replace(/\//g, '\\')
+        const unc = path.startsWith('\\\\')
+        path = path.replace(/\\+/g, '\\')
+        if (unc) path = '\\' + path
+        if (!/^[A-Za-z]:\\$/.test(path)) path = path.replace(/\\+$/, '')
+        return path.toLocaleLowerCase('en-US')
+      }
+      path = path.replace(/\\/g, '/').replace(/\/+/g, '/')
+      return path === '/' ? path : path.replace(/\/+$/, '')
     }
 
-    async function locateDroppedDirectory(entry, workspaces, currentWorkspacePath) {
-      const initial = { kind: 'directory', name: entry.name }
-      const wctx = workspaceContext(workspaces, currentWorkspacePath)
-      let result = await locateRequest({ phase: 'metadata', file: initial, ...wctx })
+    function retryWorkspaceContext(wctx, currentWorkspacePath) {
+      const currentKey = workspacePathKey(currentWorkspacePath)
+      return {
+        workspacePaths: wctx.workspacePaths.filter(path => workspacePathKey(path) !== currentKey),
+        excludedWorkspacePaths: currentWorkspacePath === undefined ? [] : [currentWorkspacePath],
+        ...(wctx.sessionId === undefined ? {} : { sessionId: wctx.sessionId }),
+      }
+    }
+
+    async function verifyFileCandidates(file, meta, result, sessionId, signal) {
+      // 兼容尚未重启的旧 Host：metadata 的唯一候选也必须经过内容指纹。
+      if (result.status === 'found') result = { status: 'sample-required', candidates: [result.path], challenge: result.challenge }
+      if (result.status !== 'sample-required') return result
+      result = await locateRequest({
+        phase: 'sample',
+        file: meta,
+        candidates: result.candidates,
+        digest: await fileSampleFingerprint(file, signal),
+        challenge: result.challenge,
+        ...(sessionId === undefined ? {} : { sessionId }),
+      }, signal)
+      const needsSafeFull = result.status === 'choose'
+        && result.fullDigestSkipped !== true
+        && file.size > LOCATE_SAMPLE_BYTES * 3
+        && file.size <= LOCATE_FULL_MAX_BYTES
+      if (result.status !== 'full-required' && !needsSafeFull) return result
+      if (file.size > LOCATE_FULL_MAX_BYTES) {
+        return { status: 'choose', candidates: result.candidates }
+      }
+      return locateRequest({
+        phase: 'full',
+        file: meta,
+        candidates: result.candidates,
+        digest: await fileFullFingerprint(file, signal),
+        challenge: result.challenge,
+        ...(sessionId === undefined ? {} : { sessionId }),
+      }, signal)
+    }
+
+    async function locateDroppedFile(file, workspaces, currentWorkspacePath, sessionId, signal) {
+      const meta = droppedFileMeta(file)
+      const wctx = workspaceContext(workspaces, currentWorkspacePath, sessionId)
+      const metadata = await locateRequest({ phase: 'metadata', file: meta, ...wctx }, signal)
+      let result = await verifyFileCandidates(file, meta, metadata, sessionId, signal)
+      if (result.status !== 'not-found') return result
+
+      // 排除已通过元数据但内容不匹配的候选；旧 Host 仍通过排除当前根兼容重试。
+      const retryContext = currentWorkspacePath === undefined ? wctx : retryWorkspaceContext(wctx, currentWorkspacePath)
+      result = await locateRequest({
+        phase: 'metadata', file: meta, ...retryContext,
+        excludedCandidates: Array.isArray(metadata.candidates) ? metadata.candidates : [],
+      }, signal)
+      return verifyFileCandidates(file, meta, result, sessionId, signal)
+    }
+
+    async function verifyDirectoryCandidates(entry, initial, result, sessionId, signal) {
+      if (result.status === 'found') result = { status: 'directory-structure-required', candidates: [result.path], challenge: result.challenge }
       if (result.status !== 'directory-structure-required') return result
-      const meta = { ...initial, structure: await readDirectoryStructure(entry) }
-      result = await locateRequest({ phase: 'directory-structure', file: meta, candidates: result.candidates })
+      const meta = { ...initial, structure: await readDirectoryStructure(entry, signal) }
+      result = await locateRequest({
+        phase: 'directory-structure',
+        file: meta,
+        candidates: result.candidates,
+        challenge: result.challenge,
+        ...(sessionId === undefined ? {} : { sessionId }),
+      }, signal)
       if (result.status !== 'directory-content-required') return result
-      return locateRequest({ phase: 'directory-content', file: meta, candidates: result.candidates, directorySamples: await readDirectoryContentSamples(entry, result.paths) })
+      return locateRequest({
+        phase: 'directory-content',
+        file: meta,
+        candidates: result.candidates,
+        directorySamples: await readDirectoryContentSamples(entry, result.paths, signal),
+        challenge: result.challenge,
+        ...(sessionId === undefined ? {} : { sessionId }),
+      }, signal)
+    }
+
+    async function locateDroppedDirectory(entry, workspaces, currentWorkspacePath, sessionId, signal) {
+      const initial = { kind: 'directory', name: entry.name }
+      const wctx = workspaceContext(workspaces, currentWorkspacePath, sessionId)
+      const metadata = await locateRequest({ phase: 'metadata', file: initial, ...wctx }, signal)
+      let result = await verifyDirectoryCandidates(entry, initial, metadata, sessionId, signal)
+      if (result.status !== 'not-found') return result
+      const retryContext = currentWorkspacePath === undefined ? wctx : retryWorkspaceContext(wctx, currentWorkspacePath)
+      result = await locateRequest({
+        phase: 'metadata', file: initial, ...retryContext,
+        excludedCandidates: Array.isArray(metadata.candidates) ? metadata.candidates : [],
+      }, signal)
+      return verifyDirectoryCandidates(entry, initial, result, sessionId, signal)
     }
 
     function choosePathInteractive(name, candidates) {
       // 多个候选无法区分时，用简单弹窗让用户选择序号（后续可换成更友好的 UI）
-      const max = candidates.length > 10 ? 10 : candidates.length
-      const lines = candidates.slice(0, max).map((p, i) => '[' + i + '] ' + p).join('\n')
+      const shown = []
+      let textLength = 0
+      for (const path of candidates.slice(0, 20)) {
+        const line = '[' + shown.length + '] ' + path
+        if (shown.length > 0 && textLength + line.length + 1 > 16000) break
+        shown.push(line.slice(0, 16000))
+        textLength += line.length + 1
+      }
+      const max = shown.length
+      const lines = shown.join('\n')
       const raw = window.prompt('「' + name + '」有多个匹配路径，输入序号选择：\n' + lines)
-      if (raw === null || raw === undefined) return undefined
-      const idx = parseInt(raw, 10)
-      return Number.isInteger(idx) && idx >= 0 && idx < max ? candidates[idx] : undefined
+      if (raw === null || raw === undefined || !/^\d+$/.test(raw.trim())) return undefined
+      const idx = Number(raw.trim())
+      return idx >= 0 && idx < max ? candidates[idx] : undefined
     }
 
     async function processFilesLocate(files, opts) {
-      const { inputActions, getDraft, workspaces, currentWorkspacePath } = opts
-      statusStore.set('正在定位文件中…')
+      if (files.length > MAX_TOP_LEVEL_FILES) {
+        statusStore.show('✗ 一次最多处理 ' + MAX_TOP_LEVEL_FILES + ' 个文件')
+        return
+      }
+      const { sessionId, inputActions, getDraft, workspaces, currentWorkspacePath, signal } = opts
+      const isActive = typeof opts.isActive === 'function' ? opts.isActive : () => true
+      const statusToken = statusStore.begin('正在定位文件中…')
       const found = []
       const failures = []
       for (const file of files) {
         try {
-          const result = await locateDroppedFile(file, workspaces, currentWorkspacePath)
+          const result = await locateDroppedFile(file, workspaces, currentWorkspacePath, sessionId, signal)
+          if (!isActive()) { statusStore.cancel(statusToken); return }
           if (result.status === 'found') found.push(result.path)
           else if (result.status === 'choose') {
             const picked = choosePathInteractive(file.name, result.candidates)
@@ -498,35 +928,43 @@ window.__ModuleLoader__.load({
             else failures.push(file.name)
           } else failures.push(file.name)
         } catch (err) {
+          if (!isActive()) { statusStore.cancel(statusToken); return }
           failures.push(file.name)
         }
       }
-      if (found.length > 0) insertPaths(inputActions, getDraft(), found)
-      if (failures.length > 0) statusStore.set('✗ 未能定位：' + failures.join('、'))
-      // 成功时不在此处清除：由 DropZone 监听草稿变化、在草稿框渲染后清除
+      if (!isActive()) { statusStore.cancel(statusToken); return }
+      if (found.length > 0) insertPaths(inputActions, getDraft(), found, isActive)
+      const summary = [
+        found.length > 0 ? '✓ 已定位 ' + found.length + ' 个原始路径' : '',
+        failures.length > 0 ? '✗ 未能定位：' + summarizeItems(failures, '、') : '',
+      ].filter(Boolean).join('　')
+      statusStore.finish(statusToken, summary || '✗ 没有文件被定位')
     }
 
     async function processDirectoryLocate(entry, opts) {
-      const { inputActions, getDraft, workspaces, currentWorkspacePath } = opts
-      statusStore.set('正在定位目录中…')
+      const { sessionId, inputActions, getDraft, workspaces, currentWorkspacePath, signal } = opts
+      const isActive = typeof opts.isActive === 'function' ? opts.isActive : () => true
+      const statusToken = statusStore.begin('正在定位目录中…')
       try {
-        const result = await locateDroppedDirectory(entry, workspaces, currentWorkspacePath)
+        const result = await locateDroppedDirectory(entry, workspaces, currentWorkspacePath, sessionId, signal)
+        if (!isActive()) { statusStore.cancel(statusToken); return }
         if (result.status === 'found') {
-          insertPaths(inputActions, getDraft(), [result.path])
-          // 成功时不在此处清除：由 DropZone 监听草稿变化、在草稿框渲染后清除
+          insertPaths(inputActions, getDraft(), [result.path], isActive)
+          statusStore.finish(statusToken, '✓ 已定位目录原始路径：' + entry.name)
         } else if (result.status === 'choose') {
           const picked = choosePathInteractive(entry.name, result.candidates)
           if (picked) {
-            insertPaths(inputActions, getDraft(), [picked])
-            // 成功时不在此处清除：由 DropZone 监听草稿变化、在草稿框渲染后清除
+            insertPaths(inputActions, getDraft(), [picked], isActive)
+            statusStore.finish(statusToken, '✓ 已定位目录原始路径：' + entry.name)
           } else {
-            statusStore.set('✗ 未选择目录路径')
+            statusStore.finish(statusToken, '✗ 未选择目录路径')
           }
         } else {
-          statusStore.set('✗ 未能定位目录：' + entry.name)
+          statusStore.finish(statusToken, '✗ 未能定位目录：' + entry.name)
         }
       } catch (err) {
-        statusStore.set('✗ 未能定位目录：' + entry.name)
+        if (!isActive()) { statusStore.cancel(statusToken); return }
+        statusStore.finish(statusToken, '✗ 未能定位目录：' + entry.name)
       }
     }
 
@@ -535,24 +973,85 @@ window.__ModuleLoader__.load({
     // 输入框工具行：回形针按钮（点开文件选择器）
     function PaperclipButton(props) {
       const pickRef = React.useRef(null)
+      const operationRef = React.useRef(0)
+      const operationHandleRef = React.useRef(null)
       const optsRef = React.useRef({})
       optsRef.current = {
-        sessionId: props.sessionId,
+        sessionId: normalizeSessionId(props.sessionId),
         inputActions: props.inputActions,
-        getDraft: () => (props.input && props.input.draft) || '',
+        draft: (props.input && props.input.draft) || '',
+        workspaces: props.workspaces,
+        currentWorkspacePath: currentSessionWorkspacePath(props.sessions),
       }
+      const cancelCurrent = () => {
+        operationRef.current += 1
+        const handle = operationHandleRef.current
+        operationHandleRef.current = null
+        if (handle) { handle.controller.abort(); handle.release() }
+      }
+      React.useEffect(() => { cancelCurrent() }, [props.sessionId, props.inputActions])
+      React.useEffect(() => {
+        const store = props.sessions && props.sessions.list
+        if (!store || typeof store.subscribe !== 'function') return undefined
+        return store.subscribe(() => {
+          if (!currentSessionMatches(props.sessions, optsRef.current.sessionId)) cancelCurrent()
+        })
+      }, [props.sessions])
+      React.useEffect(() => () => { cancelCurrent() }, [])
       const onClick = () => { if (pickRef.current) pickRef.current.click() }
       const onChange = (e) => {
         const files = Array.from(e.target.files || [])
         e.target.value = ''
-        if (files.length > 0) void processFiles(files, optsRef.current)
+        if (files.length === 0) return
+        cancelCurrent()
+        const handle = operationController()
+        operationHandleRef.current = handle
+        const operationId = ++operationRef.current
+        const snapshot = {
+          ...optsRef.current,
+          mode: currentMode,
+          modeRevision,
+          signal: handle.controller.signal,
+          getDraft: () => optsRef.current.draft,
+        }
+        snapshot.isActive = () => operationRef.current === operationId
+          && !snapshot.signal.aborted
+          && optsRef.current.sessionId === snapshot.sessionId
+          && optsRef.current.inputActions === snapshot.inputActions
+          && currentSessionMatches(props.sessions, snapshot.sessionId)
+          && currentMode === snapshot.mode
+          && modeRevision === snapshot.modeRevision
+        void (async () => {
+          try {
+            if (snapshot.mode === 'locate') {
+              if (files.length > MAX_TOP_LEVEL_FILES) {
+                statusStore.show('✗ 一次最多处理 ' + MAX_TOP_LEVEL_FILES + ' 个文件')
+                return
+              }
+              const directPaths = []
+              const unresolved = []
+              for (const file of files) {
+                const path = shellPathOf(file)
+                if (path) directPaths.push(path)
+                else unresolved.push(file)
+              }
+              if (!snapshot.isActive()) return
+              if (directPaths.length > 0) insertPaths(snapshot.inputActions, snapshot.getDraft(), directPaths, snapshot.isActive)
+              if (unresolved.length > 0) await processFilesLocate(unresolved, snapshot)
+              else statusStore.show('✓ 已获取 ' + directPaths.length + ' 个文件的原始路径')
+            } else await processFiles(files, snapshot)
+          } finally {
+            handle.release()
+            if (operationHandleRef.current === handle) operationHandleRef.current = null
+          }
+        })()
       }
       return React.createElement(React.Fragment, null,
         React.createElement('div', { className: 'dsh-paperclip-wrap' },
           React.createElement('button', {
             type: 'button',
             className: 'dsh-paperclip',
-            'aria-label': '上传文件',
+            'aria-label': '选择文件',
             onClick: onClick,
           },
             React.createElement('svg', { viewBox: '0 0 16 16', width: 14, height: 14, fill: 'none', 'aria-hidden': true },
@@ -576,43 +1075,57 @@ window.__ModuleLoader__.load({
       )
     }
 
-    // 定位中才挂载：监听草稿变化，草稿框渲染出路径后清除「正在定位」提示。
-    // 不定位时不渲染此组件，因此平时完全不监听草稿。
-    function DraftWatcher(props) {
-      const prevDraftRef = React.useRef((props.input && props.input.draft) || '')
-      React.useEffect(() => {
-        const currentDraft = (props.input && props.input.draft) || ''
-        const prev = prevDraftRef.current
-        prevDraftRef.current = currentDraft
-        if (currentDraft !== prev) {
-          statusStore.clear()
-        }
-      }, [props.input && props.input.draft])
-      return null
-    }
-
     // 输入框上方 dock：拖拽监听 + 浮层 + 状态条
     function DropZone(props) {
       const [drag, setDrag] = React.useState(false)
+      const ownerRef = React.useRef(null)
       const statusText = useStatus()
       const [statusBottom, setStatusBottom] = React.useState(110)
       const [statusLeft, setStatusLeft] = React.useState('50%')
       const depthRef = React.useRef(0)
       const busyRef = React.useRef(false)
+      const operationRef = React.useRef(0)
+      const operationHandleRef = React.useRef(null)
       const optsRef = React.useRef({})
       optsRef.current = {
-        sessionId: props.sessionId,
+        sessionId: normalizeSessionId(props.sessionId),
         inputActions: props.inputActions,
-        getDraft: () => (props.input && props.input.draft) || '',
+        draft: (props.input && props.input.draft) || '',
         workspaces: props.workspaces,
-        currentWorkspacePath: (() => {
-          try {
-            const s = props.sessions && props.sessions.list && props.sessions.list.getSnapshot()
-            const id = s && s.current
-            return id === undefined ? undefined : (s.byId[id] && s.byId[id].cwd)
-          } catch { return undefined }
-        })(),
+        currentWorkspacePath: currentSessionWorkspacePath(props.sessions),
       }
+      const ownerRecordRef = React.useRef()
+      if (!ownerRecordRef.current) {
+        ownerRecordRef.current = { ownerRef, optsRef }
+      }
+      React.useEffect(() => {
+        const record = ownerRecordRef.current
+        dropOwners.add(record)
+        return () => { dropOwners.delete(record) }
+      }, [])
+
+      const cancelCurrent = () => {
+        operationRef.current += 1
+        busyRef.current = false
+        const handle = operationHandleRef.current
+        operationHandleRef.current = null
+        if (handle) { handle.controller.abort(); handle.release() }
+      }
+
+      React.useEffect(() => {
+        cancelCurrent()
+        statusStore.clear()
+      }, [props.sessionId])
+
+      React.useEffect(() => {
+        const store = props.sessions && props.sessions.list
+        if (!store || typeof store.subscribe !== 'function') return undefined
+        return store.subscribe(() => {
+          if (!currentSessionMatches(props.sessions, optsRef.current.sessionId)) cancelCurrent()
+        })
+      }, [props.sessions])
+
+      React.useEffect(() => () => { cancelCurrent() }, [])
 
       // 让状态提示跟随 composer 输入框：动态定位到输入框上方
       React.useLayoutEffect(() => {
@@ -643,32 +1156,53 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         // 全部挂在 window 捕获阶段：事件流的第一个节点，先于 DSH 自带的
         // document 级拖拽图片处理（InputBar intakeImages / DropOverlay）。
-        const hasFiles = (e) => e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files')
+        const hasFiles = (e) => shouldHandleDataTransfer(e.dataTransfer)
+        const claim = (e) => {
+          if (selectDropOwner(e, props.sessions) !== ownerRecordRef.current) return false
+          if (claimedDropEvents.has(e)) return false
+          claimedDropEvents.add(e)
+          return true
+        }
         const onDragEnter = (e) => {
-          if (!hasFiles(e)) return
+          if (!hasFiles(e) || !claim(e)) return
           e.preventDefault()
           e.stopPropagation()
           depthRef.current += 1
           setDrag(true)
         }
         const onDragOver = (e) => {
-          if (!hasFiles(e)) return
+          if (!hasFiles(e) || !claim(e)) return
           e.preventDefault()
           e.stopPropagation()
           if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
         }
         const onDragLeave = (e) => {
+          if (!hasFiles(e)) {
+            if (e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files') && depthRef.current > 0) {
+              depthRef.current -= 1
+              if (depthRef.current <= 0) { depthRef.current = 0; setDrag(false) }
+            }
+            return
+          }
+          if (!claim(e)) return
           e.stopPropagation()
           depthRef.current -= 1
           if (depthRef.current <= 0) { depthRef.current = 0; setDrag(false) }
         }
         const onDrop = (e) => {
-          if (!hasFiles(e)) return
+          const carriesFiles = e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files')
+          const fileDrop = hasFiles(e)
+          const pathOnly = fileDrop || carriesFiles ? undefined : extractPaths(e)
+          if (!fileDrop && (!pathOnly || pathOnly.length === 0)) {
+            if (carriesFiles) { depthRef.current = 0; setDrag(false) }
+            return
+          }
+          if (!claim(e)) return
           e.preventDefault()
           e.stopPropagation()
           depthRef.current = 0
           setDrag(false)
-          void handleDrop(e)
+          void handleDrop(e, pathOnly)
         }
         window.addEventListener('dragenter', onDragEnter, true)
         window.addEventListener('dragover', onDragOver, true)
@@ -682,64 +1216,109 @@ window.__ModuleLoader__.load({
         }
       }, [])
 
-      async function handleDrop(e) {
+      function beginOperation() {
+        const started = optsRef.current
+        const id = ++operationRef.current
+        const mode = currentMode
+        const revision = modeRevision
+        const handle = operationController()
+        operationHandleRef.current = handle
+        return {
+          ...started,
+          id,
+          mode,
+          modeRevision: revision,
+          signal: handle.controller.signal,
+          release: () => {
+            handle.release()
+            if (operationHandleRef.current === handle) operationHandleRef.current = null
+          },
+          getDraft: () => optsRef.current.draft || '',
+          isActive: () => operationRef.current === id
+            && !handle.controller.signal.aborted
+            && optsRef.current.sessionId === started.sessionId
+            && optsRef.current.inputActions === started.inputActions
+            && currentSessionMatches(props.sessions, started.sessionId)
+            && currentMode === mode
+            && modeRevision === revision,
+        }
+      }
+
+      async function handleDrop(e, extractedPaths) {
         if (busyRef.current) return
         const files = Array.from((e.dataTransfer && e.dataTransfer.files) || [])
 
         // 桌面壳（preload 捕获阶段已解析好磁盘原始路径）
         const shellPaths = drainShellPaths()
+        if (shellPaths.length > MAX_TOP_LEVEL_FILES) {
+          statusStore.show('✗ 一次最多处理 ' + MAX_TOP_LEVEL_FILES + ' 个路径')
+          return
+        }
         if (shellPaths.length > 0) {
-          insertPaths(optsRef.current.inputActions, optsRef.current.getDraft(), shellPaths)
-          statusStore.set('✓ 已获取 ' + shellPaths.length + ' 个原始路径（桌面壳）')
+          insertPaths(optsRef.current.inputActions, optsRef.current.draft, shellPaths)
+          statusStore.show('✓ 已获取 ' + shellPaths.length + ' 个原始路径（桌面壳）')
           return
         }
 
         // 拖拽自带路径 → 直接取地址，零上传
-        const paths = extractPaths(e)
+        const paths = extractedPaths || extractPaths(e)
+        if (paths.length > MAX_TOP_LEVEL_FILES) {
+          statusStore.show('✗ 一次最多处理 ' + MAX_TOP_LEVEL_FILES + ' 个路径')
+          return
+        }
         if (paths.length > 0) {
-          insertPaths(optsRef.current.inputActions, optsRef.current.getDraft(), paths)
-          statusStore.set('✓ 已获取 ' + paths.length + ' 个文件路径')
+          insertPaths(optsRef.current.inputActions, optsRef.current.draft, paths)
+          statusStore.show('✓ 已获取 ' + paths.length + ' 个文件路径')
           return
         }
 
         // 目录拖拽 → 按模式走「目录上传」或「目录定位」
         const dirEntries = getDirectoryEntries(e.dataTransfer && e.dataTransfer.items)
+        if (dirEntries.length > MAX_ROOT_DIRECTORIES) {
+          statusStore.show('✗ 一次最多处理 ' + MAX_ROOT_DIRECTORIES + ' 个目录')
+          return
+        }
         if (dirEntries.length > 0) {
+          const operation = beginOperation()
           busyRef.current = true
           try {
             for (const dirEntry of dirEntries) {
-              if (currentMode === 'locate') {
-                await processDirectoryLocate(dirEntry, optsRef.current)
+              if (!operation.isActive()) break
+              if (operation.mode === 'locate') {
+                await processDirectoryLocate(dirEntry, operation)
               } else {
-                await processDirectoryUpload(dirEntry, optsRef.current)
+                await processDirectoryUpload(dirEntry, operation)
               }
             }
           } finally {
-            busyRef.current = false
+            operation.release()
+            if (operationRef.current === operation.id) busyRef.current = false
           }
           return
         }
 
         // 普通文件 → 按模式走「上传兜底」或「搜索定位」
         if (files.length === 0) return
+        const operation = beginOperation()
         busyRef.current = true
         try {
-          if (currentMode === 'locate') {
-            await processFilesLocate(files, optsRef.current)
+          if (operation.mode === 'locate') {
+            await processFilesLocate(files, operation)
           } else {
-            await processFiles(files, optsRef.current)
+            await processFiles(files, operation)
           }
         } finally {
-          busyRef.current = false
+          operation.release()
+          if (operationRef.current === operation.id) busyRef.current = false
         }
       }
 
       return React.createElement(React.Fragment, null,
+        React.createElement('span', { ref: ownerRef, className: 'dsh-drop-owner', 'aria-hidden': true }),
         statusText ? React.createElement('div', { className: 'dsh-drop-status', style: { bottom: statusBottom, left: statusLeft } },
           statusText.indexOf('正在') === 0 ? React.createElement('span', { className: 'dsh-drop-status-spinner' }) : null,
           React.createElement('span', { className: 'dsh-drop-status-text' }, statusText)
         ) : null,
-        currentMode === 'locate' && statusText && statusText.indexOf('正在') === 0 ? React.createElement(DraftWatcher, { input: props.input }) : null,
         drag ? React.createElement('div', { className: 'dsh-drop-overlay' },
           React.createElement('div', { className: 'dsh-drop-overlay-inner' }, '松开鼠标，获取文件')
         ) : null
@@ -760,56 +1339,145 @@ window.__ModuleLoader__.load({
 
     function SettingsSection(props) {
       const [mode, setMode] = React.useState(currentMode)
+      const [modeMsg, setModeMsg] = React.useState('')
       const [clearing, setClearing] = React.useState(false)
       const [clearMsg, setClearMsg] = React.useState('')
       const [size, setSize] = React.useState(null)
-      React.useEffect(() => { readMode().then((m) => { currentMode = m; setMode(m) }) }, [])
-      const pick = (m) => { currentMode = m; setMode(m); void writeMode(m) }
-      // 拉取 .dsh-drops 磁盘占用（host 递归统计）
-      const loadSize = async () => {
+      React.useEffect(() => {
+        let active = true
+        const revision = modeRevision
+        refreshSettings().then((m) => {
+          if (!active || revision !== modeRevision) return
+          currentMode = m
+          setMode(m)
+        })
+        return () => { active = false }
+      }, [])
+      const pick = (m) => {
+        abortActiveOperations()
+        statusStore.clear()
+        const revision = ++modeRevision
+        currentMode = m
+        setMode(m)
+        setModeMsg('')
+        void writeMode(m).catch((error) => {
+          if (revision === modeRevision) setModeMsg('✗ ' + String((error && error.message) || error))
+        })
+      }
+      const mountedRef = React.useRef(true)
+      const sizeRequestRef = React.useRef(0)
+      const cleanupRef = React.useRef({ generation: 0, controller: undefined })
+      const cancelCleanup = () => {
+        cleanupRef.current.generation += 1
+        if (cleanupRef.current.controller) cleanupRef.current.controller.abort()
+        cleanupRef.current.controller = undefined
+      }
+      React.useEffect(() => () => { mountedRef.current = false; cancelCleanup() }, [])
+      const settingsSessionId = () => {
         try {
-          let sessionId
-          try {
-            const s = props.sessions && props.sessions.list && props.sessions.list.getSnapshot()
-            sessionId = s && s.current
-          } catch { sessionId = undefined }
+          const snapshot = props.sessions && props.sessions.list && props.sessions.list.getSnapshot()
+          return normalizeSessionId(snapshot && snapshot.current)
+        } catch { return undefined }
+      }
+      // 拉取 .dsh-drops 磁盘占用（host 递归统计）。
+      const loadSize = async (sessionId = settingsSessionId(), generation, signal) => {
+        const requestId = ++sizeRequestRef.current
+        const canCommit = () => mountedRef.current
+          && requestId === sizeRequestRef.current
+          && settingsSessionId() === sessionId
+          && (generation === undefined || cleanupRef.current.generation === generation)
+        try {
           const response = await fetch(API_PATH + '/size', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ sessionId }),
+            body: JSON.stringify(sessionId === undefined ? {} : { sessionId }),
+            signal,
           })
           const data = await response.json().catch(() => ({}))
-          setSize(response.ok && typeof data.size === 'number' ? data.size : null)
-        } catch { setSize(null) }
+          if (canCommit()) setSize(response.ok && typeof data.size === 'number' ? data.size : null)
+          return response.ok ? data : undefined
+        } catch {
+          if (canCommit() && (!signal || !signal.aborted)) setSize(null)
+          return undefined
+        }
+      }
+      const waitForCleanup = async (sessionId, generation, signal) => {
+        const canCommit = () => mountedRef.current
+          && cleanupRef.current.generation === generation
+          && settingsSessionId() === sessionId
+        for (let attempt = 0; attempt < 20 && canCommit(); attempt += 1) {
+          await abortableDelay(500, signal)
+          if (!canCommit()) return
+          const state = await loadSize(sessionId, generation, signal)
+          if (!canCommit()) return
+          if (!state) continue
+          if (state.cleanupError) {
+            setClearMsg('⚠ 已从工作区移除，但磁盘清理失败：' + state.cleanupError)
+            return
+          }
+          if (!state.cleanupPending && state.size === 0) {
+            setClearMsg('✓ 已清空上传目录')
+            return
+          }
+        }
+        if (canCommit()) setClearMsg('✓ 已清空上传目录（磁盘清理仍在进行）')
       }
       React.useEffect(() => { void loadSize() }, [])
+      React.useEffect(() => {
+        const store = props.sessions && props.sessions.list
+        if (!store || typeof store.subscribe !== 'function') return undefined
+        let currentSessionId = settingsSessionId()
+        return store.subscribe(() => {
+          const nextSessionId = settingsSessionId()
+          if (nextSessionId === currentSessionId) return
+          currentSessionId = nextSessionId
+          cancelCleanup()
+          setClearing(false)
+          setClearMsg('')
+          void loadSize(nextSessionId)
+        })
+      }, [props.sessions])
       // 清空上传目录：删除当前会话工作区（或回退）下的 .dsh-drops
       const clearDrops = async () => {
-        if (clearing) return
+        if (cleanupRef.current.controller) return
+        cancelCleanup()
+        const generation = cleanupRef.current.generation
+        const controller = new AbortController()
+        cleanupRef.current.controller = controller
+        const sessionId = settingsSessionId()
+        const canCommit = () => mountedRef.current
+          && cleanupRef.current.generation === generation
+          && cleanupRef.current.controller === controller
+          && settingsSessionId() === sessionId
         setClearing(true)
         setClearMsg('')
         try {
-          let sessionId
-          try {
-            const s = props.sessions && props.sessions.list && props.sessions.list.getSnapshot()
-            sessionId = s && s.current
-          } catch { sessionId = undefined }
           const response = await fetch(API_PATH + '/clear', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ sessionId }),
+            body: JSON.stringify(sessionId === undefined ? { global: true } : { sessionId }),
+            signal: controller.signal,
           })
           const data = await response.json().catch(() => ({}))
+          if (!canCommit()) return
           if (response.ok) {
-            setClearMsg('✓ 已清空上传目录')
-            void loadSize()
+            setClearMsg(data.cleanupError
+              ? '⚠ 已从工作区移除，但磁盘清理失败：' + data.cleanupError
+              : data.cleanupPending ? '✓ 已清空上传目录（磁盘清理中）' : '✓ 已清空上传目录')
+            if (data.cleanupPending) await waitForCleanup(sessionId, generation, controller.signal)
+            else await loadSize(sessionId, generation, controller.signal)
           } else {
             setClearMsg('✗ 清空失败：' + (data.error || 'HTTP ' + response.status))
           }
         } catch (err) {
-          setClearMsg('✗ 清空失败：' + String((err && err.message) || err))
+          if (canCommit() && (!err || err.name !== 'AbortError')) {
+            setClearMsg('✗ 清空失败：' + String((err && err.message) || err))
+          }
         } finally {
-          setClearing(false)
+          if (canCommit()) {
+            cleanupRef.current.controller = undefined
+            setClearing(false)
+          }
         }
       }
       return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: '10px' } },
@@ -818,6 +1486,7 @@ window.__ModuleLoader__.load({
           React.createElement('input', { type: 'radio', name: 'dsh-file-drop-mode', checked: mode === 'upload', onChange: () => pick('upload') }),
           React.createElement('span', null, '上传到工作区（.dsh-drops，稳定可靠）')
         ),
+        modeMsg ? React.createElement('div', { className: 'dsh-mode-msg' }, modeMsg) : null,
         React.createElement('div', { className: 'dsh-clear-row' },
           React.createElement('button', {
             type: 'button',
@@ -843,7 +1512,10 @@ window.__ModuleLoader__.load({
     }
 
     const CSS = `
-      .dsh-clear-row { display: flex; align-items: center; gap: 8px; padding-left: 24px; }
+      .dsh-drop-owner { display: none; }
+      .dsh-clear-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding-left: 24px; }
+      .dsh-mode-msg, .dsh-clear-msg { overflow-wrap: anywhere; }
+      .dsh-mode-msg { padding-left: 24px; font-size: 12px; color: var(--dsw-alias-label-error, #d92d20); }
       .dsh-clear-btn {
         display: inline-flex; align-items: center; gap: 6px;
         height: 28px; padding: 0 12px;
@@ -965,8 +1637,11 @@ window.__ModuleLoader__.load({
     const inject = ['slots', 'workspaces', 'sessions']
 
     function apply(ctx) {
-      // 初始化当前模式（异步读取，默认 upload）
-      readMode().then((m) => { currentMode = m })
+      // 初始化当前模式；用户已切换时忽略较早的异步读取结果。
+      const revision = modeRevision
+      refreshSettings().then((m) => {
+        if (revision === modeRevision) currentMode = m
+      })
 
       ctx.effect(() => {
         const style = document.createElement('style')
@@ -977,7 +1652,12 @@ window.__ModuleLoader__.load({
       }, 'dsh-file-drop: styles')
 
       ctx.slots.inject('conversation.input.left', () => ctx.slots.register(
-        { name: 'conversation.input.left', id: 'file-drop-pick', order: 0 },
+        {
+          name: 'conversation.input.left',
+          id: 'file-drop-pick',
+          order: 0,
+          inject: () => ({ workspaces: ctx.workspaces, sessions: ctx.sessions }),
+        },
         (props) => React.createElement(PaperclipButton, props)
       ))
 
@@ -1003,6 +1683,16 @@ window.__ModuleLoader__.load({
       ))
     }
 
+    exports.__test = {
+      uploadPayload,
+      readEntryAll,
+      statusStore,
+      chooseDropOwner,
+      refreshUploadCapability,
+      capabilitySnapshot: () => ({ uploadProtocolVersion, uploadProtocolKnown }),
+      workspacePathKey,
+      shouldHandleDataTransfer,
+    }
     exports.inject = inject
     exports.apply = apply
     return module.exports

@@ -1,19 +1,33 @@
-// dsh-file-drop · Host half
-// POST /api/dsh-file-drop：保存拖拽上传的普通文件（无桌面壳时的兜底路径）。
-// - text：直接写 UTF-8 内容
-// - binary：接收 base64，解码后写真实字节（node fs 原生能力，无需 subprocess）
-// 落盘位置：会话工作区 .dsh-drops/，无会话时回退 $DSH_HOME/.dsh-drops
-import { mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, statSync } from 'node:fs'
-import { join, basename } from 'node:path'
-import { homedir } from 'node:os'
-import { locate } from './locate/locator.js'
+// dsh-file-drop / Host routes.
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { realpath } from 'node:fs/promises'
+import { join, resolve } from 'node:path'
+import {
+  HttpError,
+  MAX_DIRECTORY_BODY_BYTES,
+  MAX_FILE_BYTES,
+  assertDropRootCapacity,
+  clearDropRoot,
+  decodeDirectoryPayload,
+  decodeUploadPayload,
+  dshHome,
+  dropCleanupStatus,
+  errorMessage,
+  errorStatus,
+  measureDropRoot,
+  readJsonBody,
+  replaceUploadedDirectory,
+  resolveBaseDir,
+  writeUploadedFile,
+} from './host-safety.js'
+import { createSecureLocator } from './locate/secure-locator.js'
 import { FILE_DROP_ROUTE } from './locate/protocol.js'
 
 export const name = 'dsh-file-drop'
 export const inject = ['webServer', 'sessions']
 
-const MAX_BYTES = 25 * 1024 * 1024
 const API_PATH = '/api/dsh-file-drop'
+const MAX_FILE_BODY_BYTES = MAX_FILE_BYTES * 2 + 1024 * 1024
 
 function sendJson(res, status, value) {
   const body = JSON.stringify(value)
@@ -25,109 +39,93 @@ function sendJson(res, status, value) {
   res.end(body)
 }
 
-// 同源校验：带 Origin 的请求必须与 Host 一致（防跨站探测）；无 Origin 的本地调用放行。
+function sendError(res, error, fallbackStatus = 500) {
+  sendJson(res, errorStatus(error, fallbackStatus), { error: errorMessage(error) })
+}
+
+function sendLocateError(res, error, fallbackStatus = 500) {
+  sendJson(res, errorStatus(error, fallbackStatus), { status: 'error', message: errorMessage(error) })
+}
+
 function fence(req) {
-  const origin = req.headers && req.headers.origin
-  const host = req.headers && req.headers.host
-  if (origin && host) {
-    const allowed = new Set(['http://' + host, 'https://' + host])
-    return allowed.has(origin)
-  }
-  return true
+  const headers = req.headers || {}
+  if (headers['sec-fetch-site'] === 'cross-site') return false
+  const origin = headers.origin
+  if (!origin) return true
+  const host = headers.host
+  if (!host) return false
+  return origin === 'http://' + host || origin === 'https://' + host
 }
 
-function sanitizeName(value) {
-  let safe = basename(String(value || ''))
-    .replace(/[\\/\u0000-\u001f\u007f]/g, '_')
-    .replace(/^\.+/, '')
-    .trim()
-  if (!safe) safe = 'file.bin'
-  if (safe.length > 180) {
-    safe = safe.slice(0, 180)
+function requireJson(req) {
+  const contentType = req.headers && req.headers['content-type']
+  if (contentType && !/^application\/json(?:\s*;|$)/i.test(contentType)) {
+    throw new HttpError(415, 'content-type must be application/json')
   }
-  return safe
 }
 
-async function readJsonBody(req, maxBytes) {
-  let raw = ''
-  for await (const chunk of req) {
-    raw += chunk
-    if (raw.length > maxBytes) {
-      req.resume()
-      throw new Error('payload too large')
-    }
-  }
-  if (raw === '') return {}
-  return JSON.parse(raw)
-}
-
-function settingsDir() {
-  return (process.env.DSH_HOME && process.env.DSH_HOME.trim()) || join(homedir(), '.dsh')
+function requireMethod(req, res, methods) {
+  if (methods.includes(req.method)) return true
+  res.writeHead(405, { allow: methods.join(', '), 'content-length': 0 })
+  res.end()
+  return false
 }
 
 function readMode() {
   try {
-    const j = JSON.parse(readFileSync(join(settingsDir(), 'dsh-file-drop.json'), 'utf8'))
-    return j && j.mode === 'locate' ? 'locate' : 'upload'
+    const value = JSON.parse(readFileSync(join(dshHome(), 'dsh-file-drop.json'), 'utf8'))
+    return value && value.mode === 'locate' ? 'locate' : 'upload'
   } catch { return 'upload' }
 }
 
 function writeMode(mode) {
-  const dir = settingsDir()
+  const dir = dshHome()
   mkdirSync(dir, { recursive: true })
   writeFileSync(join(dir, 'dsh-file-drop.json'), JSON.stringify({ mode }), 'utf8')
 }
 
+async function canonicalPathKey(value) {
+  let path
+  try { path = await realpath(value) } catch { path = resolve(value) }
+  path = resolve(path)
+  return process.platform === 'win32' || process.platform === 'darwin' ? path.toUpperCase() : path
+}
+
+export function createPathLock() {
+  const locks = new Map()
+  return async (key, operation) => {
+    const canonicalKey = await canonicalPathKey(key)
+    const previous = locks.get(canonicalKey) || Promise.resolve()
+    const current = previous.catch(() => {}).then(operation)
+    locks.set(canonicalKey, current)
+    try { return await current } finally {
+      if (locks.get(canonicalKey) === current) locks.delete(canonicalKey)
+    }
+  }
+}
+
 export async function apply(ctx) {
+  const secureLocate = createSecureLocator(ctx)
+  const withPathLock = createPathLock()
+
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
     path: API_PATH,
     handler: async (req, res) => {
       try {
-        if (!fence(req)) {
-          sendJson(res, 403, { error: '跨源请求被拒绝' })
-          return
-        }
-        if (req.method !== 'POST') {
-          res.writeHead(405, { allow: 'POST', 'content-length': 0 })
-          res.end()
-          return
-        }
-        const payload = await readJsonBody(req, MAX_BYTES * 2 + 1024 * 1024)
-        const { sessionId, name, size, kind } = payload
-        if (!name || (kind !== 'text' && kind !== 'binary')) {
-          sendJson(res, 400, { error: 'bad request' })
-          return
-        }
-        if (!Number.isFinite(Number(size)) || Number(size) > MAX_BYTES) {
-          sendJson(res, 413, { error: 'file too large (25MB limit)' })
-          return
-        }
-
-        // 落盘目录：优先当前会话工作区，回退 $DSH_HOME
-        let dir
-        const sessions = ctx.sessions
-        if (sessions && sessionId) {
-          const s = sessions.get(String(sessionId))
-          if (s && s.meta && s.meta.cwd) dir = s.meta.cwd
-        }
-        if (!dir) {
-          dir = (process.env.DSH_HOME && process.env.DSH_HOME.trim()) || join(homedir(), '.dsh')
-        }
-        const dropDir = join(dir, '.dsh-drops')
-        mkdirSync(dropDir, { recursive: true })
-
-        const safe = sanitizeName(name)
-        const target = join(dropDir, safe)
-        if (kind === 'text') {
-          writeFileSync(target, String(payload.content == null ? '' : payload.content), 'utf8')
-        } else {
-          const buf = Buffer.from(String(payload.base64 || ''), 'base64')
-          writeFileSync(target, buf)
-        }
-        sendJson(res, 200, { path: target })
-      } catch (err) {
-        sendJson(res, 500, { error: String(err && err.message || err) })
+        if (!fence(req)) { sendJson(res, 403, { error: '跨源请求被拒绝' }); return }
+        if (!requireMethod(req, res, ['POST'])) return
+        requireJson(req)
+        const payload = await readJsonBody(req, MAX_FILE_BODY_BYTES)
+        const baseDir = resolveBaseDir(ctx, payload.sessionId, Object.hasOwn(payload, 'sessionId'))
+        const file = decodeUploadPayload(payload)
+        const path = await withPathLock(baseDir, async () => {
+          await assertDropRootCapacity(baseDir, file.data.length, 1)
+          return writeUploadedFile(baseDir, file)
+        })
+        sendJson(res, 200, { path })
+      } catch (error) {
+        sendError(res, error)
       }
     },
   }), 'dsh-file-drop: save route')
@@ -136,19 +134,14 @@ export async function apply(ctx) {
     kind: 'exact',
     path: FILE_DROP_ROUTE,
     handler: async (req, res) => {
-      if (!fence(req)) {
-        sendJson(res, 403, { status: 'error', message: '跨源请求被拒绝' })
-        return
-      }
-      if (req.method !== 'POST') {
-        sendJson(res, 405, { status: 'error', message: 'method not allowed' })
-        return
-      }
       try {
+        if (!fence(req)) { sendJson(res, 403, { status: 'error', message: '跨源请求被拒绝' }); return }
+        if (!requireMethod(req, res, ['POST'])) return
+        requireJson(req)
         const request = await readJsonBody(req, 4 * 1024 * 1024)
-        sendJson(res, 200, await locate(request))
+        sendJson(res, 200, await secureLocate(request))
       } catch (error) {
-        sendJson(res, 400, { status: 'error', message: error && error.message ? error.message : String(error) })
+        sendLocateError(res, error)
       }
     },
   }), 'dsh-file-drop: locate route')
@@ -158,56 +151,19 @@ export async function apply(ctx) {
     path: API_PATH + '/dir',
     handler: async (req, res) => {
       try {
-        if (!fence(req)) {
-          sendJson(res, 403, { error: '跨源请求被拒绝' })
-          return
-        }
-        if (req.method !== 'POST') {
-          res.writeHead(405, { allow: 'POST', 'content-length': 0 })
-          res.end()
-          return
-        }
-        const payload = await readJsonBody(req, 100 * 1024 * 1024)
-        const { sessionId, dirName, entries } = payload
-        if (!dirName || !Array.isArray(entries)) {
-          sendJson(res, 400, { error: 'bad request' })
-          return
-        }
-
-        let dir
-        const sessions = ctx.sessions
-        if (sessions && sessionId) {
-          const s = sessions.get(String(sessionId))
-          if (s && s.meta && s.meta.cwd) dir = s.meta.cwd
-        }
-        if (!dir) {
-          dir = (process.env.DSH_HOME && process.env.DSH_HOME.trim()) || join(homedir(), '.dsh')
-        }
-        const rootDir = join(join(dir, '.dsh-drops'), sanitizeName(dirName))
-        // 全量覆盖：先清空旧目录，再写入，避免残留旧文件
-        rmSync(rootDir, { recursive: true, force: true })
-        mkdirSync(rootDir, { recursive: true })
-
-        for (const entry of entries) {
-          const segs = String(entry && entry.path || '')
-            .replace(/\\/g, '/')
-            .split('/')
-            .filter((s) => s && s !== '.' && s !== '..')
-            .map(sanitizeName)
-          if (segs.length === 0) continue
-          const fileName = segs.pop()
-          const subDir = segs.length ? join(rootDir, ...segs) : rootDir
-          mkdirSync(subDir, { recursive: true })
-          const target = join(subDir, fileName)
-          if (entry.kind === 'text') {
-            writeFileSync(target, String(entry.content == null ? '' : entry.content), 'utf8')
-          } else if (entry.kind === 'binary') {
-            writeFileSync(target, Buffer.from(String(entry.base64 || ''), 'base64'))
-          }
-        }
-        sendJson(res, 200, { path: rootDir })
-      } catch (err) {
-        sendJson(res, 500, { error: String(err && err.message || err) })
+        if (!fence(req)) { sendJson(res, 403, { error: '跨源请求被拒绝' }); return }
+        if (!requireMethod(req, res, ['POST'])) return
+        requireJson(req)
+        const payload = await readJsonBody(req, MAX_DIRECTORY_BODY_BYTES)
+        const baseDir = resolveBaseDir(ctx, payload.sessionId, Object.hasOwn(payload, 'sessionId'))
+        const directory = decodeDirectoryPayload(payload.dirName, payload.entries)
+        const path = await withPathLock(baseDir, async () => {
+          await assertDropRootCapacity(baseDir, directory.totalBytes, directory.entryCount)
+          return replaceUploadedDirectory(baseDir, directory)
+        })
+        sendJson(res, 200, { path, ...dropCleanupStatus(baseDir) })
+      } catch (error) {
+        sendError(res, error)
       }
     },
   }), 'dsh-file-drop: dir route')
@@ -217,113 +173,60 @@ export async function apply(ctx) {
     path: API_PATH + '/settings',
     handler: async (req, res) => {
       try {
-        if (!fence(req)) {
-          sendJson(res, 403, { error: '跨源请求被拒绝' })
-          return
-        }
+        if (!fence(req)) { sendJson(res, 403, { error: '跨源请求被拒绝' }); return }
+        if (!requireMethod(req, res, ['GET', 'POST'])) return
         if (req.method === 'GET') {
-          sendJson(res, 200, { mode: readMode() })
+          sendJson(res, 200, { mode: readMode(), uploadProtocolVersion: 2 })
           return
         }
-        if (req.method === 'POST') {
-          const payload = await readJsonBody(req, 1024 * 1024)
-          const mode = payload && payload.mode === 'locate' ? 'locate' : 'upload'
-          writeMode(mode)
-          sendJson(res, 200, { mode })
-          return
-        }
-        res.writeHead(405, { allow: 'GET, POST', 'content-length': 0 })
-        res.end()
-      } catch (err) {
-        sendJson(res, 500, { error: String(err && err.message || err) })
+        requireJson(req)
+        const payload = await readJsonBody(req, 1024 * 1024)
+        if (payload.mode !== 'upload' && payload.mode !== 'locate') throw new HttpError(400, 'invalid file-drop mode')
+        const mode = payload.mode
+        writeMode(mode)
+        sendJson(res, 200, { mode, uploadProtocolVersion: 2 })
+      } catch (error) {
+        sendError(res, error)
       }
     },
   }), 'dsh-file-drop: settings route')
-
-// 递归统计目录占用字节数；目录不存在/不可读返回 -1
-function dirSize(dir) {
-  let total = 0
-  let entries
-  try { entries = readdirSync(dir, { withFileTypes: true }) } catch { return -1 }
-  for (const entry of entries) {
-    try {
-      const st = statSync(join(dir, entry.name))
-      if (st.isDirectory()) total += dirSize(join(dir, entry.name))
-      else total += st.size
-    } catch { /* 忽略单个条目的读取错误 */ }
-  }
-  return total
-}
 
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
     path: API_PATH + '/clear',
     handler: async (req, res) => {
       try {
-        if (!fence(req)) {
-          sendJson(res, 403, { error: '跨源请求被拒绝' })
-          return
-        }
-        if (req.method !== 'POST') {
-          res.writeHead(405, { allow: 'POST', 'content-length': 0 })
-          res.end()
-          return
-        }
+        if (!fence(req)) { sendJson(res, 403, { error: '跨源请求被拒绝' }); return }
+        if (!requireMethod(req, res, ['POST'])) return
+        requireJson(req)
         const payload = await readJsonBody(req, 1024 * 1024)
-        const { sessionId } = payload
-        // 目标目录与上传落盘逻辑一致：优先当前会话工作区，回退 $DSH_HOME
-        let dir
-        const sessions = ctx.sessions
-        if (sessions && sessionId) {
-          const s = sessions.get(String(sessionId))
-          if (s && s.meta && s.meta.cwd) dir = s.meta.cwd
-        }
-        if (!dir) {
-          dir = (process.env.DSH_HOME && process.env.DSH_HOME.trim()) || join(homedir(), '.dsh')
-        }
-        const dropDir = join(dir, '.dsh-drops')
-        // force: 目录不存在时也视为成功（幂等清空）
-        rmSync(dropDir, { recursive: true, force: true })
-        sendJson(res, 200, { path: dropDir, removed: true })
-      } catch (err) {
-        sendJson(res, 500, { error: String(err && err.message || err) })
+        const hasSession = Object.hasOwn(payload, 'sessionId')
+        if (!hasSession && payload.global !== true) throw new HttpError(400, 'sessionId or explicit global scope is required')
+        const baseDir = resolveBaseDir(ctx, payload.sessionId, hasSession)
+        const path = await withPathLock(baseDir, () => clearDropRoot(baseDir, {
+          onCleanupError: (error) => ctx.logger.warn('dsh-file-drop cleanup failed for %s: %o', baseDir, error),
+        }))
+        sendJson(res, 200, { path, removed: true, ...dropCleanupStatus(baseDir) })
+      } catch (error) {
+        sendError(res, error)
       }
     },
   }), 'dsh-file-drop: clear route')
 
-  // 查询上传目录（.dsh-drops）的磁盘占用（字节）；目录不存在返回 size: -1
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
     path: API_PATH + '/size',
     handler: async (req, res) => {
       try {
-        if (!fence(req)) {
-          sendJson(res, 403, { error: '跨源请求被拒绝' })
-          return
-        }
-        if (req.method !== 'POST') {
-          res.writeHead(405, { allow: 'POST', 'content-length': 0 })
-          res.end()
-          return
-        }
+        if (!fence(req)) { sendJson(res, 403, { error: '跨源请求被拒绝' }); return }
+        if (!requireMethod(req, res, ['POST'])) return
+        requireJson(req)
         const payload = await readJsonBody(req, 1024 * 1024)
-        const { sessionId } = payload
-        // 目标目录与上传落盘逻辑一致：优先当前会话工作区，回退 $DSH_HOME
-        let dir
-        const sessions = ctx.sessions
-        if (sessions && sessionId) {
-          const s = sessions.get(String(sessionId))
-          if (s && s.meta && s.meta.cwd) dir = s.meta.cwd
-        }
-        if (!dir) {
-          dir = (process.env.DSH_HOME && process.env.DSH_HOME.trim()) || join(homedir(), '.dsh')
-        }
-        const dropDir = join(dir, '.dsh-drops')
-        // 目录不存在（-1）对用户语义等价于 0 占用，统一返回 0
-        const size = dirSize(dropDir)
-        sendJson(res, 200, { path: dropDir, size: size < 0 ? 0 : size })
-      } catch (err) {
-        sendJson(res, 500, { error: String(err && err.message || err) })
+        const baseDir = resolveBaseDir(ctx, payload.sessionId, Object.hasOwn(payload, 'sessionId'))
+        const result = await withPathLock(baseDir, () => measureDropRoot(baseDir))
+        sendJson(res, 200, { ...result, ...dropCleanupStatus(baseDir) })
+      } catch (error) {
+        sendError(res, error)
       }
     },
   }), 'dsh-file-drop: size route')
