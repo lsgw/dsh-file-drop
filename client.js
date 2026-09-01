@@ -1484,7 +1484,7 @@ window.__ModuleLoader__.load({
         React.createElement('div', { style: { fontWeight: 600 } }, '拖拽文件处理方式'),
         React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
           React.createElement('input', { type: 'radio', name: 'dsh-file-drop-mode', checked: mode === 'upload', onChange: () => pick('upload') }),
-          React.createElement('span', null, '上传到工作区（.dsh-drops，稳定可靠）')
+          React.createElement('span', null, '上传模式（.dsh-drops，稳定可靠）')
         ),
         modeMsg ? React.createElement('div', { className: 'dsh-mode-msg' }, modeMsg) : null,
         React.createElement('div', { className: 'dsh-clear-row' },
@@ -1506,7 +1506,7 @@ window.__ModuleLoader__.load({
         ),
         React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
           React.createElement('input', { type: 'radio', name: 'dsh-file-drop-mode', checked: mode === 'locate', onChange: () => pick('locate') }),
-          React.createElement('span', null, '搜索定位原始路径（零拷贝，文件须在可搜索范围内）')
+          React.createElement('span', null, '定位模式（零拷贝，文件须在可搜索范围内）')
         )
       )
     }
