@@ -12,8 +12,8 @@ import {
   activePlatformSearchProcesses,
   executePlatformCommandForTest,
   indexedSearch,
-  platformSearchHostForTest,
-} from '../locate/platform-search.js'
+  platformAdapterForTest,
+} from '../platform/index.js'
 import { SAMPLE_BYTES, SMALL_FILE_BYTES } from '../locate/protocol.js'
 
 async function fixture(t, label) {
@@ -93,7 +93,7 @@ test('platform index parsing preserves trailing spaces and candidate bounds', as
     commandExists: async () => true,
     exec: async () => Array.from({ length: 150 }, (_, index) => '/tmp/' + index + '/' + name).join('\n'),
   }
-  const candidates = await indexedSearch(name, runtime)
+  const candidates = await indexedSearch(name, 'file', runtime)
   assert.equal(candidates.length, 100)
   assert.equal(candidates[0].endsWith(name), true)
 })
@@ -187,8 +187,8 @@ test('platform host rejects bare commands and uses an absolute PowerShell path',
     executePlatformCommandForTest('powershell.exe', []),
     error => error && error.status === 500,
   )
-  if (process.platform === 'win32') assert.equal(isAbsolute(platformSearchHostForTest.powershellPath), true)
-  assert.equal(platformSearchHostForTest.everythingCommands.every(isAbsolute), true)
+  if (process.platform === 'win32') assert.equal(isAbsolute(platformAdapterForTest.powershellPath), true)
+  assert.equal(platformAdapterForTest.everythingCommands.every(isAbsolute), true)
   const childCwd = await executePlatformCommandForTest(process.execPath, ['-e', 'console.log(process.cwd())'])
   const expectedCwd = process.platform === 'win32' ? (process.env.SystemRoot || process.env.WINDIR) : '/'
   assert.equal(normalize(childCwd).toUpperCase(), normalize(expectedCwd).toUpperCase())
@@ -200,7 +200,7 @@ test('real Windows PowerShell fallback finds a directory', { skip: process.platf
   const target = join(root, name)
   await mkdir(target)
   const runtime = {
-    ...platformSearchHostForTest,
+    ...platformAdapterForTest,
     home: root,
     everythingCommands: [],
     windowsDrives: async () => [],

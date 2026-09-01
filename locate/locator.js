@@ -13,7 +13,7 @@ import {
 import { nodeDirectoryContentDigest, nodeDirectoryStructureDigest } from './directory-node.js'
 import { fullFingerprint, sampleFingerprint } from './fingerprint.js'
 import { runIsolatedTask } from './isolate.js'
-import { broadSearchRoots, indexedSearch } from './platform-search.js'
+import { broadSearchRoots, indexedSearch, platformPathKey } from '../platform/index.js'
 import { SAMPLE_BYTES, SMALL_FILE_BYTES } from './protocol.js'
 
 const MAX_CANDIDATES = 100
@@ -22,7 +22,7 @@ const MAX_WORKSPACE_ROOTS = 64
 const MAX_NAME_LENGTH = 1024
 const MAX_PATH_LENGTH = 32768
 const MAX_WALK_ENTRIES = 20000
-const WALK_TIMEOUT_MS = 5000
+const WALK_TIMEOUT_MS = 10000
 const COMMAND_PHASE_TIMEOUT_MS = 3000
 const WALK_DEPTH = 12
 const MAX_FULL_CANDIDATES = 8
@@ -191,7 +191,7 @@ async function recursiveCandidates(item, roots, budget) {
 async function metadataCandidates(item, request) {
   const candidateKey = (value) => {
     const path = normalize(value)
-    return process.platform === 'win32' || process.platform === 'darwin' ? path.toUpperCase() : path
+    return platformPathKey(path)
   }
   const excluded = new Set((Array.isArray(request.excludedCandidates) ? request.excludedCandidates : [])
     .slice(0, MAX_CANDIDATES)
@@ -290,9 +290,6 @@ async function locateDirectoryStructure(request) {
 
 export async function locate(request) {
   if (!request || !request.file) return { status: 'error', message: 'invalid dropped entry metadata' }
-  if (request.file.kind === undefined) {
-    request = { ...request, file: { ...request.file, kind: 'file' } }
-  }
   if ((request.file.kind !== 'file' && request.file.kind !== 'directory')
     || typeof request.file.name !== 'string'
     || request.file.name === ''

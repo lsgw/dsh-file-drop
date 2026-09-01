@@ -1,22 +1,28 @@
 import { realpathSync } from 'node:fs'
-import { lstat, mkdir, opendir, realpath, rename, rm, writeFile } from 'node:fs/promises'
-import { basename, isAbsolute, join, resolve } from 'node:path'
+import { lstat, mkdir, open, opendir, realpath, rename, rm, rmdir } from 'node:fs/promises'
+import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { homedir } from 'node:os'
 import { randomUUID } from 'node:crypto'
 import { runIsolatedTask } from './locate/isolate.js'
+import { platformPathKey } from './platform/index.js'
+import {
+  DEFAULT_UPLOAD_QUOTA_BYTES,
+  DEFAULT_UPLOAD_QUOTA_ENTRIES,
+  MAX_UPLOAD_QUOTA_BYTES,
+  MAX_UPLOAD_QUOTA_ENTRIES,
+  LOCATE_MODE_ERROR_CODE,
+  QUOTA_ERROR_CODE,
+  QUOTA_ERROR_MESSAGE,
+} from './settings.js'
 
-export const MAX_FILE_BYTES = 25 * 1024 * 1024
 export const MAX_DIRECTORY_FILES = 500
 export const MAX_DIRECTORY_ENTRIES = 10000
-export const MAX_DIRECTORY_BYTES = 64 * 1024 * 1024
 export const MAX_DIRECTORY_DEPTH = 32
-export const MAX_DIRECTORY_BODY_BYTES = 100 * 1024 * 1024
-export const MAX_DROP_ROOT_BYTES = 1024 * 1024 * 1024
-export const MAX_DROP_ROOT_ENTRIES = 10000
+export const UPLOAD_STAGING_DIRECTORY = '.dsh-upload-staging'
 const MAX_ENTRY_PATH_LENGTH = 4096
-const MAX_SIZE_ENTRIES = 100000
+const MAX_SIZE_ENTRIES = MAX_UPLOAD_QUOTA_ENTRIES
 const MAX_SIZE_DEPTH = 64
-const MAX_SIZE_BYTES = 1024 * 1024 * 1024 * 1024
+const MAX_SIZE_BYTES = MAX_UPLOAD_QUOTA_BYTES
 const cleanupStates = new Map()
 const MAX_CLEANUP_STATES = 256
 
@@ -33,7 +39,7 @@ function cleanupStateKey(baseDir) {
   let path
   try { path = realpathSync.native(baseDir) } catch { path = resolve(baseDir) }
   path = resolve(path)
-  return process.platform === 'win32' || process.platform === 'darwin' ? path.toUpperCase() : path
+  return platformPathKey(path)
 }
 
 export function dropCleanupStatus(baseDir) {
@@ -70,11 +76,16 @@ function beforeTimeout(promise, milliseconds, onLate) {
 }
 
 export class HttpError extends Error {
-  constructor(status, message) {
+  constructor(status, message, code) {
     super(message)
     this.name = 'HttpError'
     this.status = status
+    if (code) this.code = code
   }
+}
+
+function quotaExceeded() {
+  return new HttpError(413, QUOTA_ERROR_MESSAGE, QUOTA_ERROR_CODE)
 }
 
 export function errorStatus(error, fallback = 500) {
@@ -84,6 +95,11 @@ export function errorStatus(error, fallback = 500) {
 
 export function errorMessage(error) {
   return error && error.message ? error.message : String(error)
+}
+
+export function errorCode(error) {
+  return error && (error.code === QUOTA_ERROR_CODE || error.code === LOCATE_MODE_ERROR_CODE)
+    ? error.code : undefined
 }
 
 export async function readJsonBody(req, maxBytes) {
@@ -125,10 +141,7 @@ export function dshHome() {
 }
 
 export function sessionCwd(session) {
-  const cwd = session && (
-    session.header && session.header.cwd !== undefined ? session.header.cwd
-      : session.meta && session.meta.cwd
-  )
+  const cwd = session && session.header && session.header.cwd
   return typeof cwd === 'string' && cwd.trim() !== '' && cwd.length <= 32768
     && !cwd.includes('\0') && isAbsolute(cwd) ? cwd : undefined
 }
@@ -182,38 +195,17 @@ export function sanitizeName(value) {
   return safe || 'file.bin'
 }
 
-function strictBase64(value) {
-  if (typeof value !== 'string') throw new HttpError(400, 'binary content must be base64')
-  if (value === '') return Buffer.alloc(0)
-  if (value.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
-    throw new HttpError(400, 'invalid base64 content')
-  }
-  const data = Buffer.from(value, 'base64')
-  if (data.toString('base64') !== value) throw new HttpError(400, 'invalid base64 content')
-  return data
+function uploadSize(value, label, maxBytes) {
+  if (!Number.isSafeInteger(value) || value < 0) throw new HttpError(400, 'invalid ' + label + ' size')
+  if (value > maxBytes) throw quotaExceeded()
+  return value
 }
 
-function decodeEntry(kind, content, base64) {
-  if (kind === 'text') {
-    if (typeof content !== 'string') throw new HttpError(400, 'text content must be a string')
-    return Buffer.from(content, 'utf8')
+function uploadName(value, label) {
+  if (typeof value !== 'string' || value === '' || value.length > MAX_ENTRY_PATH_LENGTH || value.includes('\0')) {
+    throw new HttpError(400, 'invalid ' + label + ' name')
   }
-  if (kind === 'binary') return strictBase64(base64)
-  throw new HttpError(400, 'invalid file kind')
-}
-
-export function decodeUploadPayload(payload) {
-  if (!payload || typeof payload.name !== 'string' || payload.name === ''
-    || payload.name.length > MAX_ENTRY_PATH_LENGTH || payload.name.includes('\0')) {
-    throw new HttpError(400, 'invalid file name')
-  }
-  if (!Number.isSafeInteger(payload.size) || payload.size < 0 || payload.size > MAX_FILE_BYTES) {
-    throw new HttpError(413, 'file too large (25MB limit)')
-  }
-  const data = decodeEntry(payload.kind, payload.content, payload.base64)
-  if (data.length > MAX_FILE_BYTES) throw new HttpError(413, 'decoded file exceeds 25MB limit')
-  if (data.length !== payload.size) throw new HttpError(400, 'declared file size does not match decoded bytes')
-  return { name: sanitizeName(payload.name), data }
+  return sanitizeName(value)
 }
 
 function entrySegments(value) {
@@ -232,31 +224,28 @@ function entrySegments(value) {
 }
 
 function directoryCollisionKey(parts) {
-  const path = parts.join('/')
-  return process.platform === 'win32' || process.platform === 'darwin' ? path.toUpperCase() : path
+  return platformPathKey(parts.join('/'))
 }
 
-export function decodeDirectoryPayload(dirName, entries) {
-  if (typeof dirName !== 'string' || dirName === '' || dirName.length > MAX_ENTRY_PATH_LENGTH
-    || dirName.includes('\0') || !Array.isArray(entries)) {
-    throw new HttpError(400, 'invalid directory upload')
-  }
-  if (entries.length > MAX_DIRECTORY_ENTRIES) {
-    throw new HttpError(413, 'directory entry-count limit exceeded')
-  }
+function decodeDirectoryManifest(name, entries, maxBytes) {
+  if (!Array.isArray(entries)) throw new HttpError(400, 'directory entries must be an array')
+  if (entries.length > MAX_DIRECTORY_ENTRIES) throw new HttpError(413, 'directory entry-count limit exceeded')
   const files = []
   const nodes = new Map()
   const directories = new Map()
-  let fileCount = 0
   let totalBytes = 0
   for (const entry of entries) {
-    if (!entry || typeof entry !== 'object') throw new HttpError(400, 'invalid directory entry')
+    if (!entry || typeof entry !== 'object' || (entry.kind !== 'file' && entry.kind !== 'directory')) {
+      throw new HttpError(400, 'invalid directory entry')
+    }
+    if (Object.hasOwn(entry, 'content') || Object.hasOwn(entry, 'base64')) {
+      throw new HttpError(400, 'directory manifest must not contain file content')
+    }
     const path = entrySegments(entry.path)
-    const entryKind = entry.kind === 'directory' ? 'directory' : 'file'
     for (let index = 0; index < path.safe.length; index += 1) {
       const safeKey = directoryCollisionKey(path.safe.slice(0, index + 1))
       const originKey = directoryCollisionKey(path.original.slice(0, index + 1))
-      const kind = index === path.safe.length - 1 ? entryKind : 'directory'
+      const kind = index === path.safe.length - 1 ? entry.kind : 'directory'
       const existing = nodes.get(safeKey)
       if (existing && (existing.kind !== kind || existing.originKey !== originKey || kind === 'file')) {
         throw new HttpError(409, 'directory entries collide after sanitization')
@@ -264,30 +253,47 @@ export function decodeDirectoryPayload(dirName, entries) {
       if (!existing) nodes.set(safeKey, { kind, originKey })
       if (kind === 'directory') directories.set(safeKey, path.safe.slice(0, index + 1))
     }
-    if (entryKind === 'directory') {
-      if (Object.hasOwn(entry, 'content') || Object.hasOwn(entry, 'base64') || Object.hasOwn(entry, 'size')) {
-        throw new HttpError(400, 'directory marker must not contain file data')
-      }
+    if (entry.kind === 'directory') {
+      if (Object.hasOwn(entry, 'size')) throw new HttpError(400, 'directory marker must not contain a size')
       continue
     }
-    fileCount += 1
-    if (fileCount > MAX_DIRECTORY_FILES) throw new HttpError(413, 'directory file-count limit exceeded')
-    const data = decodeEntry(entry.kind, entry.content, entry.base64)
-    if (data.length > MAX_FILE_BYTES) throw new HttpError(413, 'directory entry exceeds 25MB limit')
-    if (Object.hasOwn(entry, 'size') && (!Number.isSafeInteger(entry.size) || entry.size < 0 || entry.size !== data.length)) {
-      throw new HttpError(400, 'directory entry size does not match decoded bytes')
-    }
-    totalBytes += data.length
-    if (totalBytes > MAX_DIRECTORY_BYTES) throw new HttpError(413, 'directory decoded-size limit exceeded')
-    files.push({ segments: path.safe, data })
+    if (files.length >= MAX_DIRECTORY_FILES) throw new HttpError(413, 'directory file-count limit exceeded')
+    const size = uploadSize(entry.size, 'directory entry', maxBytes)
+    totalBytes += size
+    if (!Number.isSafeInteger(totalBytes) || totalBytes > maxBytes) throw quotaExceeded()
+    files.push({ segments: path.safe, size })
   }
   return {
-    name: sanitizeName(dirName),
+    kind: 'directory',
+    name: uploadName(name, 'directory'),
     files,
     directories: [...directories.values()],
     totalBytes,
     entryCount: nodes.size + 1,
   }
+}
+
+export function decodeUploadManifest(payload, options = {}) {
+  const maxBytes = options.maxBytes ?? DEFAULT_UPLOAD_QUOTA_BYTES
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_UPLOAD_QUOTA_BYTES) {
+    throw new HttpError(500, 'invalid configured upload quota')
+  }
+  if (!payload || typeof payload !== 'object') throw new HttpError(400, 'invalid upload manifest')
+  if (payload.kind === 'file') {
+    if (Object.hasOwn(payload, 'content') || Object.hasOwn(payload, 'base64')) {
+      throw new HttpError(400, 'file manifest must not contain file content')
+    }
+    return {
+      kind: 'file',
+      name: uploadName(payload.name, 'file'),
+      files: [{ segments: [], size: uploadSize(payload.size, 'file', maxBytes) }],
+      directories: [],
+      totalBytes: payload.size,
+      entryCount: 1,
+    }
+  }
+  if (payload.kind === 'directory') return decodeDirectoryManifest(payload.name, payload.entries, maxBytes)
+  throw new HttpError(400, 'invalid upload kind')
 }
 
 async function existingInfo(path) {
@@ -334,7 +340,7 @@ async function quarantinePaths(baseDir) {
   for await (const entry of handle) {
     if (!entry.name.startsWith('.dsh-drops.deleting-')) continue
     paths.push(join(baseDir, entry.name))
-    if (paths.length > MAX_DROP_ROOT_ENTRIES) throw new HttpError(413, 'too many stale upload quarantines')
+    if (paths.length > MAX_UPLOAD_QUOTA_ENTRIES) throw new HttpError(413, 'too many stale upload quarantines')
   }
   return paths
 }
@@ -375,8 +381,7 @@ export async function ensureDropRoot(baseDir) {
   const baseReal = await realpath(baseDir)
   const rootReal = await realpath(root)
   const expected = join(baseReal, '.dsh-drops')
-  const comparable = (value) => process.platform === 'win32' || process.platform === 'darwin' ? value.toUpperCase() : value
-  if (comparable(rootReal) !== comparable(expected)) throw new HttpError(409, 'drop root escapes its workspace')
+  if (platformPathKey(rootReal) !== platformPathKey(expected)) throw new HttpError(409, 'drop root escapes its workspace')
   return root
 }
 
@@ -412,87 +417,253 @@ async function availableFileTarget(root, name) {
   throw new HttpError(409, 'too many files with the same name')
 }
 
-export async function writeUploadedFile(baseDir, file) {
-  const root = await ensureDropRoot(baseDir)
-  const target = await availableFileTarget(root, file.name)
-  const temp = join(root, '.upload-' + randomUUID() + '.tmp')
-  try {
-    await assertPlainDirectory(root)
-    await writeFile(temp, file.data, { flag: 'wx' })
-    await assertPlainDirectory(root)
-    await rename(temp, target)
-  } finally {
-    await rm(temp, { force: true }).catch(() => {})
+function uploadStageName(uploadId, kind) {
+  if (typeof uploadId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(uploadId)) {
+    throw new HttpError(400, 'invalid upload id')
   }
-  return target
+  return uploadId + (kind === 'file' ? '.file' : '.dir')
 }
 
-async function writeDirectoryTree(root, directories, files) {
-  for (const segments of [...directories].sort((left, right) => left.length - right.length)) {
+export async function ensureUploadStagingRoot(baseDir) {
+  const dropRoot = await ensureDropRoot(baseDir)
+  const stagingRoot = join(dropRoot, UPLOAD_STAGING_DIRECTORY)
+  await ensurePlainDirectory(stagingRoot)
+  const dropReal = await realpath(dropRoot)
+  const stagingReal = await realpath(stagingRoot)
+  if (platformPathKey(stagingReal) !== platformPathKey(join(dropReal, UPLOAD_STAGING_DIRECTORY))) {
+    throw new HttpError(409, 'upload staging root escapes its workspace')
+  }
+  return { dropRoot, stagingRoot }
+}
+
+async function removeInternalUploadPath(path) {
+  const info = await existingInfo(path)
+  if (!info) return
+  if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory())) {
+    throw new HttpError(409, 'unsafe upload staging path')
+  }
+  await rm(path, { recursive: info.isDirectory(), force: true })
+}
+
+export async function cleanupOrphanUploadStages(baseDir, activeNames = new Set()) {
+  const dropRoot = await ensureDropRoot(baseDir)
+  const candidate = join(dropRoot, UPLOAD_STAGING_DIRECTORY)
+  const info = await existingInfo(candidate)
+  if (!info) return false
+  if (info.isSymbolicLink() || !info.isDirectory()) throw new HttpError(409, 'unsafe upload staging root')
+  const { stagingRoot } = await ensureUploadStagingRoot(baseDir)
+  const handle = await opendir(stagingRoot)
+  for await (const entry of handle) {
+    if (activeNames.has(entry.name)) continue
+    await removeInternalUploadPath(join(stagingRoot, entry.name))
+  }
+  await removeEmptyStagingRoot(stagingRoot)
+  return Boolean(await existingInfo(stagingRoot))
+}
+
+async function createPreallocatedFile(path, size) {
+  const handle = await open(path, 'wx')
+  try { await handle.truncate(size) } finally { await handle.close() }
+}
+
+async function createManifestStageTree(root, manifest) {
+  for (const segments of [...manifest.directories].sort((left, right) => left.length - right.length)) {
     let parent = root
     for (const segment of segments) {
       parent = join(parent, segment)
       await ensurePlainDirectory(parent)
     }
   }
-  for (const file of files) {
+  const files = []
+  for (const file of manifest.files) {
     let parent = root
     for (const segment of file.segments.slice(0, -1)) {
       parent = join(parent, segment)
       await ensurePlainDirectory(parent)
     }
-    const target = join(parent, file.segments[file.segments.length - 1])
+    const path = join(parent, file.segments[file.segments.length - 1])
     await assertPlainDirectory(parent)
-    await writeFile(target, file.data, { flag: 'wx' })
+    await createPreallocatedFile(path, file.size)
+    files.push({ path, size: file.size, written: 0 })
+  }
+  return files
+}
+
+export async function createUploadStage(baseDir, manifest, uploadId) {
+  const { dropRoot, stagingRoot } = await ensureUploadStagingRoot(baseDir)
+  const stageName = uploadStageName(uploadId, manifest.kind)
+  const path = join(stagingRoot, stageName)
+  try {
+    let files
+    if (manifest.kind === 'file') {
+      await createPreallocatedFile(path, manifest.totalBytes)
+      files = [{ path, size: manifest.totalBytes, written: 0 }]
+    } else {
+      await mkdir(path)
+      files = await createManifestStageTree(path, manifest)
+    }
+    return {
+      kind: manifest.kind,
+      name: manifest.name,
+      totalBytes: manifest.totalBytes,
+      entryCount: manifest.entryCount,
+      dropRoot,
+      stagingRoot,
+      stageName,
+      path,
+      files,
+    }
+  } catch (error) {
+    await removeInternalUploadPath(path).catch(() => {})
+    throw error
   }
 }
 
-export async function replaceUploadedDirectory(baseDir, directory) {
-  const dropRoot = await ensureDropRoot(baseDir)
-  const target = join(dropRoot, directory.name)
-  const backup = join(dropRoot, '.' + directory.name + '.bak')
+function pathInside(root, candidate) {
+  const value = relative(root, candidate)
+  return value === '' || (value !== '..' && !value.startsWith('..' + sep) && !isAbsolute(value))
+}
+
+async function assertUploadStage(stage) {
+  const stageInfo = await lstat(stage.path)
+  if (stageInfo.isSymbolicLink() || (stage.kind === 'file' ? !stageInfo.isFile() : !stageInfo.isDirectory())) {
+    throw new HttpError(409, 'unsafe upload stage')
+  }
+}
+
+async function assertUploadStageFile(stage, file) {
+  await assertUploadStage(stage)
+  const info = await lstat(file.path)
+  if (info.isSymbolicLink() || !info.isFile() || info.size !== file.size) {
+    throw new HttpError(409, 'unsafe upload stage file')
+  }
+  const boundary = await realpath(stage.kind === 'file' ? stage.stagingRoot : stage.path)
+  const actual = await realpath(file.path)
+  if (!pathInside(boundary, actual)) throw new HttpError(409, 'upload stage file escapes staging root')
+}
+
+async function writeAll(handle, data, position) {
+  let written = 0
+  while (written < data.length) {
+    const result = await handle.write(data, written, data.length - written, position + written)
+    if (!result || result.bytesWritten <= 0) throw new HttpError(503, 'upload chunk write made no progress')
+    written += result.bytesWritten
+  }
+}
+
+export async function writeUploadChunk(req, stage, fileIndex, offset, maxChunkBytes) {
+  if (!Number.isSafeInteger(fileIndex) || fileIndex < 0 || fileIndex >= stage.files.length) {
+    if (typeof req.resume === 'function') req.resume()
+    throw new HttpError(400, 'invalid upload file index')
+  }
+  const file = stage.files[fileIndex]
+  if (!Number.isSafeInteger(offset) || offset !== file.written) {
+    if (typeof req.resume === 'function') req.resume()
+    throw new HttpError(409, 'upload chunk offset is not contiguous')
+  }
+  const expected = Math.min(maxChunkBytes, file.size - offset)
+  if (!Number.isSafeInteger(expected) || expected <= 0) {
+    if (typeof req.resume === 'function') req.resume()
+    throw new HttpError(409, 'upload file is already complete')
+  }
+  const declaredValue = req.headers && req.headers['content-length']
+  if (declaredValue !== undefined) {
+    const declared = Number(declaredValue)
+    if (!Number.isSafeInteger(declared) || declared !== expected) {
+      if (typeof req.resume === 'function') req.resume()
+      throw new HttpError(400, 'upload chunk content-length mismatch')
+    }
+  }
+  await assertUploadStageFile(stage, file)
+  const handle = await open(file.path, 'r+')
+  let received = 0
+  try {
+    for await (const chunk of req) {
+      const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      if (received + data.length > expected) {
+        if (typeof req.resume === 'function') req.resume()
+        throw new HttpError(413, 'upload chunk exceeds negotiated size')
+      }
+      await writeAll(handle, data, offset + received)
+      received += data.length
+    }
+  } finally {
+    await handle.close()
+  }
+  if (received !== expected) throw new HttpError(400, 'upload chunk size mismatch')
+  await assertUploadStageFile(stage, file)
+  file.written += received
+  return { received, written: file.written, size: file.size }
+}
+
+export async function verifyUploadStage(stage) {
+  await assertUploadStage(stage)
+  for (const file of stage.files) {
+    if (file.written !== file.size) throw new HttpError(409, 'upload is incomplete')
+    await assertUploadStageFile(stage, file)
+  }
+}
+
+async function commitStagedDirectory(baseDir, stage, beforeCommit) {
+  const target = join(stage.dropRoot, stage.name)
+  const backup = join(stage.dropRoot, '.' + stage.name + '.bak')
   let existed = await assertSafeTarget(target, true)
   const backupExists = await assertSafeTarget(backup, true)
+  if (beforeCommit) beforeCommit()
   if (backupExists) {
-    if (existed) {
-      await rm(backup, { recursive: true, force: true })
-    } else {
-      await rename(backup, target)
-      existed = true
-    }
+    if (existed) await rm(backup, { recursive: true, force: true })
+    else { await rename(backup, target); existed = true }
   }
-
-  const temp = join(dropRoot, '.upload-' + randomUUID() + '.tmp')
-  await mkdir(temp)
+  await assertPlainDirectory(stage.dropRoot)
+  await assertPlainDirectory(stage.path)
+  if (existed) await rename(target, backup)
   try {
-    await writeDirectoryTree(temp, directory.directories || [], directory.files)
-    await assertPlainDirectory(dropRoot)
-    await assertPlainDirectory(temp)
-    if (existed) await rename(target, backup)
-    try {
-      await rename(temp, target)
-    } catch (error) {
-      if (existed) {
-        try { await rename(backup, target) } catch (restoreError) {
-          throw new AggregateError([error, restoreError], 'directory replacement and rollback failed')
-        }
-      }
-      throw error
-    }
-    if (existed) {
-      const quarantine = join(baseDir, '.dsh-drops.deleting-' + randomUUID())
-      try {
-        await rename(backup, quarantine)
-        trackQuarantineCleanup(baseDir, quarantine)
-      } catch (error) {
-        setCleanupState(cleanupStateKey(baseDir), { pending: false, error: errorMessage(error) })
-      }
-    }
+    if (beforeCommit) beforeCommit()
+    await rename(stage.path, target)
   } catch (error) {
-    await rm(temp, { recursive: true, force: true }).catch(() => {})
+    if (existed) {
+      try { await rename(backup, target) } catch (restoreError) {
+        throw new AggregateError([error, restoreError], 'directory replacement and rollback failed')
+      }
+    }
     throw error
   }
+  if (existed) {
+    const quarantine = join(baseDir, '.dsh-drops.deleting-' + randomUUID())
+    try {
+      await rename(backup, quarantine)
+      trackQuarantineCleanup(baseDir, quarantine)
+    } catch (error) {
+      setCleanupState(cleanupStateKey(baseDir), { pending: false, error: errorMessage(error) })
+    }
+  }
   return target
+}
+
+async function removeEmptyStagingRoot(stagingRoot) {
+  try { await rmdir(stagingRoot) } catch (error) {
+    if (error?.code !== 'ENOENT' && error?.code !== 'ENOTEMPTY' && error?.code !== 'EEXIST') throw error
+  }
+}
+
+export async function commitUploadStage(baseDir, stage, options = {}) {
+  await verifyUploadStage(stage)
+  let target
+  if (stage.kind === 'directory') target = await commitStagedDirectory(baseDir, stage, options.beforeCommit)
+  else {
+    target = await availableFileTarget(stage.dropRoot, stage.name)
+    await assertPlainDirectory(stage.dropRoot)
+    await assertPlainDirectory(stage.stagingRoot)
+    if (options.beforeCommit) options.beforeCommit()
+    await rename(stage.path, target)
+  }
+  await removeEmptyStagingRoot(stage.stagingRoot)
+  return target
+}
+
+export async function removeUploadStage(stage) {
+  await removeInternalUploadPath(stage.path)
+  await removeEmptyStagingRoot(stage.stagingRoot)
 }
 
 export async function measureDropRoot(baseDir, options = {}) {
@@ -506,25 +677,22 @@ export async function measureDropRoot(baseDir, options = {}) {
 }
 
 export async function assertDropRootCapacity(baseDir, incomingBytes, incomingEntries, options = {}) {
-  const maxBytes = options.maxBytes || MAX_DROP_ROOT_BYTES
-  const maxEntries = options.maxEntries || MAX_DROP_ROOT_ENTRIES
+  const maxBytes = options.maxBytes ?? DEFAULT_UPLOAD_QUOTA_BYTES
+  const maxEntries = options.maxEntries ?? DEFAULT_UPLOAD_QUOTA_ENTRIES
   const measureFn = options.measureFn || measureDropRoot
   if (!Number.isSafeInteger(incomingBytes) || incomingBytes < 0
-    || !Number.isSafeInteger(incomingEntries) || incomingEntries < 0) {
+    || !Number.isSafeInteger(incomingEntries) || incomingEntries < 0
+    || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_UPLOAD_QUOTA_BYTES
+    || !Number.isSafeInteger(maxEntries) || maxEntries < 1 || maxEntries > MAX_UPLOAD_QUOTA_ENTRIES) {
     throw new HttpError(400, 'invalid upload quota request')
   }
-  if (incomingBytes > maxBytes || incomingEntries > maxEntries) {
-    throw new HttpError(413, 'upload exceeds workspace drop-root quota')
-  }
+  if (incomingBytes > maxBytes || incomingEntries > maxEntries) throw quotaExceeded()
   const cleanup = dropCleanupStatus(baseDir)
   if (cleanup.cleanupPending) throw new HttpError(409, 'previous upload cleanup is still in progress')
   if (cleanup.cleanupError) throw new HttpError(409, 'previous upload cleanup failed; clear the upload directory again')
   const current = await measureFn(baseDir)
-  if (current.size + incomingBytes > maxBytes) {
-    throw new HttpError(413, 'workspace upload storage exceeds 1GB limit')
-  }
-  if (current.entries + incomingEntries > maxEntries) {
-    throw new HttpError(413, 'workspace upload entry-count limit exceeded')
+  if (current.size + incomingBytes > maxBytes || current.entries + incomingEntries > maxEntries) {
+    throw quotaExceeded()
   }
   return current
 }

@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process'
-import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { isolatedChildOptions } from '../platform/index.js'
 
 const RUNNER_PATH = fileURLToPath(new URL('./isolate-runner.js', import.meta.url))
 const MAX_ACTIVE_TASKS = 4
@@ -15,21 +15,6 @@ function taskError(status, message) {
   return error
 }
 
-function childEnvironment() {
-  if (process.platform === 'win32') {
-    const systemRoot = process.env.SystemRoot || process.env.WINDIR || ''
-    return {
-      SystemRoot: systemRoot,
-      WINDIR: systemRoot,
-      PATH: dirname(process.execPath),
-      PATHEXT: '.COM;.EXE;.BAT;.CMD',
-      TEMP: process.env.TEMP || '',
-      TMP: process.env.TMP || '',
-      USERPROFILE: process.env.USERPROFILE || '',
-    }
-  }
-  return { PATH: '/usr/bin:/bin', HOME: process.env.HOME || '', LANG: 'C.UTF-8' }
-}
 
 export function activeIsolatedTasks() {
   return activeTasks
@@ -94,9 +79,7 @@ export async function runIsolatedTask(task, payload, options = {}) {
 
     try {
       child = spawn(process.execPath, [RUNNER_PATH], {
-        cwd: dirname(RUNNER_PATH),
-        env: childEnvironment(),
-        windowsHide: true,
+        ...isolatedChildOptions(RUNNER_PATH),
         stdio: ['pipe', 'pipe', 'ignore'],
       })
     } catch (error) {

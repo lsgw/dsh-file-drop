@@ -1,10 +1,6 @@
 // dsh-file-drop · Client half（DSH web __ModuleLoader__ 格式）
-// 两个入口共用同一套处理逻辑（壳直取原始路径 → uri-list → 上传兜底）：
-// 1. 回形针按钮（conversation.input.left）：点击弹文件选择器
-// 2. 拖拽（window 捕获阶段拦截，先于 DSH 自带图片拖拽处理）：
-//    - 桌面壳 preload 已解析路径 → 直接取
-//    - DataTransfer 自带路径（uri-list）→ 直接取
-//    - 普通文件 → POST /api/dsh-file-drop 上传到工作区
+// 两种模式职责互斥：upload 只复制文件/目录，locate 只获取或搜索原始路径。
+// 回形针按钮选择文件；上传和定位模式都接管所有文件和目录，避免旁路各自的 Host 契约。
 window.__ModuleLoader__.load({
   id: 'dsh-file-drop',
   factory: (require) => {
@@ -14,30 +10,30 @@ window.__ModuleLoader__.load({
 
     const React = require('react')
 
-    const TEXT_EXT = new Set([
-      'md', 'markdown', 'txt', 'text', 'json', 'csv', 'tsv', 'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs',
-      'py', 'pyw', 'yaml', 'yml', 'toml', 'ini', 'cfg', 'conf', 'log', 'xml', 'html', 'htm', 'css',
-      'scss', 'sass', 'less', 'sh', 'bash', 'zsh', 'fish', 'sql', 'go', 'rs', 'java', 'kt', 'kts',
-      'c', 'h', 'cpp', 'hpp', 'cc', 'hh', 'rb', 'php', 'lua', 'r', 'swift', 'vue', 'svelte', 'env',
-      'properties', 'gitignore', 'dockerfile', 'makefile', 'gradle', 'lock',
-    ])
-    const TEXT_MIME = new Set([
-      'application/json', 'application/xml', 'application/javascript', 'application/x-yaml',
-      'application/sql', 'application/x-sh', 'application/x-httpd-php', 'application/ecmascript',
-    ])
-    const MAX_BYTES = 25 * 1024 * 1024
     const MAX_TOP_LEVEL_FILES = 500
-    const MAX_DIRECTORY_BYTES = 64 * 1024 * 1024
     const MAX_DIRECTORY_ENTRIES = 10000
     const MAX_ROOT_DIRECTORIES = 32
+    const DEFAULT_SETTINGS = Object.freeze({ mode: 'upload', uploadQuotaMiB: 10000, uploadQuotaEntries: 10000 })
+    const FAIL_CLOSED_SETTINGS = Object.freeze({ ...DEFAULT_SETTINGS, mode: 'locate' })
+    const MAX_UPLOAD_QUOTA_MIB = 1024 * 1024
+    const MAX_UPLOAD_QUOTA_ENTRIES = 100000
+    const MIB_BYTES = 1024 * 1024
+    const QUOTA_ERROR_CODE = 'quota_exceeded'
+    const QUOTA_ERROR_MESSAGE = '已达上传配额，需清理 .dsh-drops'
+    const LOCATE_MODE_ERROR_CODE = 'locate_mode'
+    const LOCATE_MODE_ERROR_MESSAGE = '当前为定位模式，未上传'
+    const MODE_READ_ERROR_MESSAGE = '无法确认当前拖拽模式，未上传'
+    const MAX_NEGOTIATED_CHUNK_BYTES = 4 * 1024 * 1024
     const API_PATH = '/api/dsh-file-drop'
+    const UPLOAD_PATH = API_PATH + '/upload'
     const SETTINGS_PATH = API_PATH + '/settings'
-    let currentMode = 'upload'
-    let uploadProtocolVersion = 1
-    let uploadProtocolKnown = false
-    let capabilityRefresh
+    let currentSettings = { ...DEFAULT_SETTINGS }
+    let currentMode = currentSettings.mode
+    let settingsRefresh
+    let settingsLoaded = false
     let modeRevision = 0
-    let modeWriteQueue = Promise.resolve()
+    let settingsWriteQueue = Promise.resolve()
+    let modeChannel
     const activeControllers = new Set()
     const claimedDropEvents = new WeakSet()
     const dropOwners = new Set()
@@ -60,86 +56,214 @@ window.__ModuleLoader__.load({
       activeControllers.clear()
     }
 
-    async function readMode(signal) {
+    function validSettings(data) {
+      return data && !Array.isArray(data) && typeof data === 'object'
+        && Object.keys(data).sort().join(',') === 'mode,uploadQuotaEntries,uploadQuotaMiB'
+        && (data.mode === 'upload' || data.mode === 'locate')
+        && Number.isSafeInteger(data.uploadQuotaMiB) && data.uploadQuotaMiB >= 1
+        && data.uploadQuotaMiB <= MAX_UPLOAD_QUOTA_MIB
+        && Number.isSafeInteger(data.uploadQuotaEntries) && data.uploadQuotaEntries >= 1
+        && data.uploadQuotaEntries <= MAX_UPLOAD_QUOTA_ENTRIES
+    }
+
+    async function readSettings(signal, fallback = true) {
       try {
-        const res = await fetch(SETTINGS_PATH, { signal })
-        if (!res.ok) throw new Error('settings HTTP ' + res.status)
-        const data = await res.json()
-        uploadProtocolVersion = Number.isSafeInteger(data.uploadProtocolVersion)
-          && data.uploadProtocolVersion >= 2 ? data.uploadProtocolVersion : 1
-        uploadProtocolKnown = true
-        return data.mode === 'locate' ? 'locate' : 'upload'
-      } catch {
-        uploadProtocolVersion = 1
-        uploadProtocolKnown = false
-        return 'upload'
+        const response = await fetch(SETTINGS_PATH, { signal })
+        const data = await response.json()
+        if (!response.ok || !validSettings(data)) throw new Error('invalid settings response')
+        return {
+          mode: data.mode,
+          uploadQuotaMiB: data.uploadQuotaMiB,
+          uploadQuotaEntries: data.uploadQuotaEntries,
+        }
+      } catch (error) {
+        if (!fallback) throw error
+        return { ...FAIL_CLOSED_SETTINGS }
       }
     }
 
     function refreshSettings() {
-      if (!capabilityRefresh) {
-        capabilityRefresh = readMode().finally(() => { capabilityRefresh = undefined })
+      if (!settingsRefresh) {
+        settingsRefresh = readSettings().then((settings) => {
+          currentSettings = settings
+          settingsLoaded = true
+          return settings
+        }).finally(() => { settingsRefresh = undefined })
       }
-      return capabilityRefresh
+      return settingsRefresh
     }
 
-    async function refreshUploadCapability(signal) {
-      await abortableCallback(signal, (resolve, reject) => refreshSettings().then(resolve, reject))
-      return uploadProtocolKnown
+    function adoptSettings(settings) {
+      currentSettings = settings
+      settingsLoaded = true
+      if (settings.mode !== currentMode) {
+        abortActiveOperations()
+        statusStore.clear()
+        currentMode = settings.mode
+        modeRevision += 1
+      }
+      return settings
     }
 
-    function writeMode(mode) {
+    function writeSettings(patch) {
       const persist = async () => {
         const response = await fetch(SETTINGS_PATH, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ mode }),
+          body: JSON.stringify(patch),
         })
-        if (!response.ok) throw new Error('保存拖拽模式失败（HTTP ' + response.status + '）')
+        const data = await response.json().catch(() => ({}))
+        if (!response.ok || !validSettings(data)) {
+          throw new Error(data.error || ('保存拖拽设置失败（HTTP ' + response.status + '）'))
+        }
+        const latest = await readSettings(undefined, false)
+        adoptSettings(latest)
+        if (modeChannel) modeChannel.postMessage(latest)
+        return latest
       }
-      modeWriteQueue = modeWriteQueue.catch(() => {}).then(persist)
-      return modeWriteQueue
+      settingsWriteQueue = settingsWriteQueue.catch(() => {}).then(persist)
+      return settingsWriteQueue
     }
 
-    // ---- 文件识别与读取 ----
-
-    function looksText(file) {
-      if (file.type && file.type.startsWith('text/')) return true
-      if (file.type && TEXT_MIME.has(file.type)) return true
-      const dot = file.name.lastIndexOf('.')
-      if (dot < 0) return false
-      return TEXT_EXT.has(file.name.slice(dot + 1).toLowerCase())
+    async function refreshModeForAction() {
+      await settingsWriteQueue
+      adoptSettings(await readSettings(undefined, false))
+      return currentMode
     }
 
-    function bytesToBase64(bytes, signal) {
-      let binary = ''
-      const chunkSize = 0x8000
-      for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    function beginModeChange(nextMode) {
+      abortActiveOperations()
+      statusStore.clear()
+      modeRevision += 1
+      if (nextMode === 'locate') currentMode = 'locate'
+      return currentMode
+    }
+
+    async function readUserUploadUsage(signal) {
+      const response = await fetch(API_PATH + '/size', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{}',
+        signal,
+      })
+      return { response, data: await response.json().catch(() => ({})) }
+    }
+
+    async function clearUserUploadRoot(signal) {
+      const response = await fetch(API_PATH + '/clear', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ global: true }),
+        signal,
+      })
+      return { response, data: await response.json().catch(() => ({})) }
+    }
+
+    // ---- 有界分块上传 ----
+
+    function sessionPayload(sessionId) {
+      return sessionId === undefined ? {} : { sessionId }
+    }
+
+    function uploadRequestError(data, status, fallback) {
+      const code = data && data.code
+      const known = code === QUOTA_ERROR_CODE || code === LOCATE_MODE_ERROR_CODE
+      const message = code === QUOTA_ERROR_CODE ? QUOTA_ERROR_MESSAGE
+        : code === LOCATE_MODE_ERROR_CODE ? LOCATE_MODE_ERROR_MESSAGE
+          : (data && data.error) || (fallback + '（HTTP ' + status + '）')
+      const error = new Error(message)
+      if (known) error.code = code
+      return error
+    }
+
+    async function uploadControl(action, payload, signal) {
+      const response = await fetch(UPLOAD_PATH + '/' + action, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal,
+      })
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) throw uploadRequestError(data, response.status, '上传请求失败')
+      return data
+    }
+
+    async function cancelUpload(uploadId, sessionId) {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 3000)
+      try {
+        await uploadControl('cancel', { ...sessionPayload(sessionId), uploadId }, controller.signal)
+      } catch { /* Host 会在下次上传时回收遗留 staging。 */ }
+      finally { clearTimeout(timer) }
+    }
+
+    function chunkSessionHeaders(sessionId) {
+      return sessionId === undefined
+        ? { 'x-dsh-session-scope': 'global' }
+        : { 'x-dsh-session-scope': 'session', 'x-dsh-session-id': encodeURIComponent(String(sessionId)) }
+    }
+
+    async function uploadFileChunks(file, fileIndex, uploadId, chunkBytes, sessionId, signal, onProgress) {
+      let offset = 0
+      while (offset < file.size) {
         throwIfAborted(signal)
-        binary += String.fromCharCode.apply(null, bytes.subarray(offset, offset + chunkSize))
+        const end = Math.min(offset + chunkBytes, file.size)
+        const response = await fetch(UPLOAD_PATH + '/chunk', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/octet-stream',
+            'x-dsh-upload-id': uploadId,
+            'x-dsh-file-index': String(fileIndex),
+            'x-dsh-upload-offset': String(offset),
+            ...chunkSessionHeaders(sessionId),
+          },
+          body: file.slice(offset, end, 'application/octet-stream'),
+          signal,
+        })
+        const data = await response.json().catch(() => ({}))
+        if (!response.ok) throw uploadRequestError(data, response.status, '上传分块失败')
+        if (data.written !== end || data.size !== file.size) throw new Error('Host 返回了无效的上传进度')
+        offset = end
+        if (onProgress) onProgress(end)
       }
-      return btoa(binary)
     }
 
-    function sameBytes(left, right) {
-      if (left.length !== right.length) return false
-      for (let index = 0; index < left.length; index += 1) {
-        if (left[index] !== right[index]) return false
+    async function uploadChunked(manifest, files, opts = {}) {
+      const totalBytes = files.reduce((total, file) => total + file.size, 0)
+      if (!Number.isSafeInteger(totalBytes)) throw new Error('上传内容大小无效')
+      let uploadId
+      try {
+        const initialized = await uploadControl('init', {
+          ...sessionPayload(opts.sessionId),
+          ...manifest,
+        }, opts.signal)
+        uploadId = initialized.uploadId
+        const chunkBytes = initialized.chunkBytes
+        if (typeof uploadId !== 'string' || uploadId.length > 64
+          || !Number.isSafeInteger(chunkBytes) || chunkBytes <= 0 || chunkBytes > MAX_NEGOTIATED_CHUNK_BYTES
+          || initialized.fileCount !== files.length || initialized.totalBytes !== totalBytes) {
+          throw new Error('Host 返回了无效的上传会话')
+        }
+        let completedBytes = 0
+        for (let index = 0; index < files.length; index += 1) {
+          const file = files[index]
+          await uploadFileChunks(file, index, uploadId, chunkBytes, opts.sessionId, opts.signal, (written) => {
+            if (opts.onProgress) opts.onProgress(completedBytes + written, totalBytes)
+          })
+          completedBytes += file.size
+        }
+        throwIfAborted(opts.signal)
+        const finished = await uploadControl('finish', {
+          ...sessionPayload(opts.sessionId),
+          uploadId,
+        }, opts.signal)
+        if (!finished.path) throw new Error('Host 未返回上传路径')
+        uploadId = undefined
+        return finished
+      } catch (error) {
+        if (uploadId) await cancelUpload(uploadId, opts.sessionId)
+        throw error
       }
-      return true
-    }
-
-    async function uploadPayload(file, signal) {
-      throwIfAborted(signal)
-      const bytes = new Uint8Array(await file.arrayBuffer())
-      throwIfAborted(signal)
-      if (looksText(file)) {
-        try {
-          const content = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes)
-          if (sameBytes(new TextEncoder().encode(content), bytes)) return { kind: 'text', content }
-        } catch { /* 非法 UTF-8 必须按二进制保留原始字节。 */ }
-      }
-      return { kind: 'binary', base64: bytesToBase64(bytes, signal) }
     }
 
     // ---- 桌面壳 ----
@@ -174,12 +298,9 @@ window.__ModuleLoader__.load({
         if (url.protocol !== 'file:') return null
         const host = decodeURIComponent(url.hostname)
         let path = decodeURIComponent(url.pathname)
-        const windowsDrive = /^\/[A-Za-z]:\//.test(path)
-        if (windowsDrive) path = path.slice(1)
+        const driveUri = /^\/[A-Za-z]:\//.test(path)
+        if (driveUri) path = path.slice(1).replaceAll('/', '\\')
         if (host && host.toLowerCase() !== 'localhost') path = '//' + host + path
-        if (windowsDrive || /^Win/i.test(navigator.platform || '')) {
-          path = path.replaceAll('/', '\\')
-        }
         return path || null
       } catch { return null }
     }
@@ -282,14 +403,7 @@ window.__ModuleLoader__.load({
     }
 
     function shouldHandleDataTransfer(dataTransfer) {
-      if (!dataTransfer || !Array.from(dataTransfer.types || []).includes('Files')) return false
-      const fileItems = Array.from(dataTransfer.items || []).filter((item) => item && item.kind === 'file')
-      if (fileItems.length > 0) {
-        return fileItems.some((item) => !item.type || !item.type.toLowerCase().startsWith('image/'))
-      }
-      const files = Array.from(dataTransfer.files || [])
-      if (files.length > 0) return files.some((file) => !file.type || !file.type.toLowerCase().startsWith('image/'))
-      return true
+      return Boolean(dataTransfer && Array.from(dataTransfer.types || []).includes('Files'))
     }
 
     function getDirectoryEntries(items) {
@@ -376,6 +490,14 @@ window.__ModuleLoader__.load({
       )
     }
 
+    if (typeof window.BroadcastChannel === 'function') {
+      modeChannel = new window.BroadcastChannel('dsh-file-drop-settings')
+      modeChannel.addEventListener('message', (event) => {
+        if (!validSettings(event.data)) return
+        adoptSettings({ ...event.data })
+      })
+    }
+
     // ---- 光标处插入（零跟踪：坐标直接读 textarea 的 DOM 原生 selection） ----
 
     // composer 的 textarea 是真实原生 <textarea>，父容器稳定锚点 [data-input-scroll]；
@@ -429,8 +551,8 @@ window.__ModuleLoader__.load({
       }
     }
 
-    // 共用处理：壳路径优先，其余走上传兜底
-    async function processFiles(files, opts) {
+    // 上传模式始终分块复制文件内容，不读取原始路径。
+    async function processFilesUpload(files, opts) {
       if (!files.length) return
       if (files.length > MAX_TOP_LEVEL_FILES) {
         statusStore.show('✗ 一次最多处理 ' + MAX_TOP_LEVEL_FILES + ' 个文件')
@@ -438,61 +560,42 @@ window.__ModuleLoader__.load({
       }
       const { sessionId, inputActions, getDraft, signal } = opts
       const isActive = typeof opts.isActive === 'function' ? opts.isActive : () => true
-      const direct = []
-      const rest = []
-      for (const f of files) {
-        const path = shellPathOf(f)
-        if (path) direct.push(path)
-        else rest.push(f)
-      }
-      if (!isActive()) return
-      if (direct.length > 0) {
-        insertPaths(inputActions, getDraft(), direct, isActive)
-        statusStore.show('✓ 已获取 ' + direct.length + ' 个原始路径（桌面壳）')
-      }
-      if (rest.length === 0) return
-
-      const statusToken = statusStore.begin('正在上传 ' + rest.length + ' 个文件…')
+      const statusToken = statusStore.begin('正在上传 ' + files.length + ' 个文件…')
       const ok = []
       const errs = []
-      for (const f of rest) {
+      let quotaReached = false
+      let locateModeBlocked = false
+      for (const file of files) {
         if (!isActive()) { statusStore.cancel(statusToken); return }
-        if (f.size > MAX_BYTES) { errs.push(f.name + '（超过 25MB 限制）'); continue }
         try {
-          const payload = await uploadPayload(f, signal)
-          if (!isActive()) { statusStore.cancel(statusToken); return }
-          const response = await fetch(API_PATH, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({
-              sessionId: sessionId,
-              name: f.name,
-              size: f.size,
-              type: f.type || '',
-              ...payload,
-            }),
+          const result = await uploadChunked({ kind: 'file', name: file.name, size: file.size }, [file], {
+            sessionId,
             signal,
+            onProgress: (written, total) => {
+              if (isActive()) statusStore.update(statusToken, '正在上传 ' + file.name + '（' + formatSize(written) + ' / ' + formatSize(total) + '）…')
+            },
           })
           if (!isActive()) { statusStore.cancel(statusToken); return }
-          const data = await response.json().catch(() => ({}))
+          ok.push(result.path)
+        } catch (error) {
           if (!isActive()) { statusStore.cancel(statusToken); return }
-          if (response.ok && data.path) ok.push(data.path)
-          else errs.push(f.name + '：' + (data.error || '保存失败'))
-        } catch (err) {
-          if (!isActive()) { statusStore.cancel(statusToken); return }
-          errs.push(f.name + '：' + String((err && err.message) || err))
+          if (error && error.code === QUOTA_ERROR_CODE) { quotaReached = true; break }
+          if (error && error.code === LOCATE_MODE_ERROR_CODE) { locateModeBlocked = true; break }
+          errs.push(file.name + '：' + String((error && error.message) || error))
         }
       }
       if (!isActive()) { statusStore.cancel(statusToken); return }
       if (ok.length > 0) insertPaths(inputActions, getDraft(), ok, isActive)
       const text = [
         ok.length > 0 ? '✓ ' + ok.length + ' 个文件已上传' : '',
+        quotaReached ? '✗ ' + QUOTA_ERROR_MESSAGE : '',
+        locateModeBlocked ? '✗ ' + LOCATE_MODE_ERROR_MESSAGE : '',
         errs.length > 0 ? '✗ ' + summarizeItems(errs) : '',
       ].filter(Boolean).join('　')
       statusStore.finish(statusToken, text || '没有文件被处理')
     }
 
-    // 目录：递归遍历后整包上传，落盘为同名目录，插入目录根路径（upload 方案）
+    // 目录只上传结构清单，文件内容逐块发送，空子目录会被保留。
     async function processDirectoryUpload(entry, opts) {
       const { sessionId, inputActions, getDraft, signal } = opts
       const isActive = typeof opts.isActive === 'function' ? opts.isActive : () => true
@@ -508,9 +611,9 @@ window.__ModuleLoader__.load({
           false,
           MAX_DIRECTORY_ENTRIES + 1
         )
-      } catch (err) {
+      } catch (error) {
         if (!isActive()) { statusStore.cancel(statusToken); return }
-        statusStore.finish(statusToken, '✗ 读取目录失败：' + String((err && err.message) || err))
+        statusStore.finish(statusToken, '✗ 读取目录失败：' + String((error && error.message) || error))
         return
       }
       if (!isActive()) { statusStore.cancel(statusToken); return }
@@ -523,67 +626,32 @@ window.__ModuleLoader__.load({
         statusStore.finish(statusToken, '✗ 目录超过 ' + MAX_DIRECTORY_ENTRIES + ' 个条目限制，未上传任何内容')
         return
       }
-      if (all.some((record) => record.kind === 'directory')) {
-        const capabilityKnown = await refreshUploadCapability(signal)
-        if (!isActive()) { statusStore.cancel(statusToken); return }
-        if (!capabilityKnown) {
-          statusStore.finish(statusToken, '✗ 无法确认 Host 目录协议，未上传以避免丢失空子目录')
-          return
-        }
-      }
-      const entries = []
-      const skipped = []
-      let totalBytes = 0
-      for (const record of all) {
-        if (!isActive()) { statusStore.cancel(statusToken); return }
-        if (record.kind === 'directory') {
-          if (uploadProtocolVersion >= 2) entries.push({ kind: 'directory', path: record.path })
-          continue
-        }
-        const { path, file } = record
-        if (file.size > MAX_BYTES) { skipped.push(file.name); continue }
-        totalBytes += file.size
-        if (totalBytes > MAX_DIRECTORY_BYTES) {
-          statusStore.finish(statusToken, '✗ 目录可上传文件总大小超过 64MB，未上传任何内容')
-          return
-        }
-        try {
-          const payload = await uploadPayload(file, signal)
-          if (!isActive()) { statusStore.cancel(statusToken); return }
-          entries.push({ path: path || file.name, size: file.size, ...payload })
-        } catch {
-          if (!isActive()) { statusStore.cancel(statusToken); return }
-          skipped.push(file.name)
-        }
-      }
-      if (entries.length === 0 && skipped.length > 0) {
-        statusStore.finish(statusToken, '✗ 目录内没有可上传的文件（跳过 ' + skipped.length + ' 个文件）')
-        return
-      }
-      const uploadFileCount = entries.filter((item) => item.kind !== 'directory').length
-      statusStore.update(statusToken, '正在上传目录 ' + entry.name + '（' + uploadFileCount + ' 个文件）…')
+      const entries = all.map((record) => record.kind === 'directory'
+        ? { kind: 'directory', path: record.path }
+        : { kind: 'file', path: record.path || record.file.name, size: record.file.size })
+      const files = fileRecords.map((record) => record.file)
+      statusStore.update(statusToken, '正在上传目录 ' + entry.name + '（' + files.length + ' 个文件）…')
       try {
-        const response = await fetch(API_PATH + '/dir', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ sessionId, dirName: entry.name, entries }),
+        const result = await uploadChunked({ kind: 'directory', name: entry.name, entries }, files, {
+          sessionId,
           signal,
+          onProgress: (written, total) => {
+            if (isActive()) statusStore.update(statusToken, '正在上传目录 ' + entry.name + '（' + formatSize(written) + ' / ' + formatSize(total) + '）…')
+          },
         })
         if (!isActive()) { statusStore.cancel(statusToken); return }
-        const data = await response.json().catch(() => ({}))
+        insertPaths(inputActions, getDraft(), [result.path], isActive)
+        const cleanupNote = result.cleanupError
+          ? '；原目录清理失败：' + result.cleanupError
+          : result.cleanupPending ? '；原目录正在后台清理' : ''
+        statusStore.finish(statusToken, '✓ 目录已上传' + cleanupNote)
+      } catch (error) {
         if (!isActive()) { statusStore.cancel(statusToken); return }
-        if (response.ok && data.path) {
-          insertPaths(inputActions, getDraft(), [data.path], isActive)
-          const cleanupNote = data.cleanupError
-            ? '；旧版本目录清理失败：' + data.cleanupError
-            : data.cleanupPending ? '；旧版本目录正在后台清理' : ''
-          statusStore.finish(statusToken, '✓ 目录已上传' + (skipped.length ? '（跳过 ' + skipped.length + ' 个文件）' : '') + cleanupNote)
-        } else {
-          statusStore.finish(statusToken, '✗ 目录上传失败：' + (data.error || '保存失败'))
-        }
-      } catch (err) {
-        if (!isActive()) { statusStore.cancel(statusToken); return }
-        statusStore.finish(statusToken, '✗ 目录上传失败：' + String((err && err.message) || err))
+        statusStore.finish(statusToken, error && error.code === QUOTA_ERROR_CODE
+          ? '✗ ' + QUOTA_ERROR_MESSAGE
+          : error && error.code === LOCATE_MODE_ERROR_CODE
+            ? '✗ ' + LOCATE_MODE_ERROR_MESSAGE
+            : '✗ 目录上传失败：' + String((error && error.message) || error))
       }
     }
 
@@ -783,33 +851,15 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function workspacePathKey(value) {
-      if (typeof value !== 'string') return ''
-      let path = value.trim()
-      if (/^Win/i.test(navigator.platform || '')) {
-        path = path.replace(/\//g, '\\')
-        const unc = path.startsWith('\\\\')
-        path = path.replace(/\\+/g, '\\')
-        if (unc) path = '\\' + path
-        if (!/^[A-Za-z]:\\$/.test(path)) path = path.replace(/\\+$/, '')
-        return path.toLocaleLowerCase('en-US')
-      }
-      path = path.replace(/\\/g, '/').replace(/\/+/g, '/')
-      return path === '/' ? path : path.replace(/\/+$/, '')
-    }
-
     function retryWorkspaceContext(wctx, currentWorkspacePath) {
-      const currentKey = workspacePathKey(currentWorkspacePath)
       return {
-        workspacePaths: wctx.workspacePaths.filter(path => workspacePathKey(path) !== currentKey),
+        workspacePaths: wctx.workspacePaths,
         excludedWorkspacePaths: currentWorkspacePath === undefined ? [] : [currentWorkspacePath],
         ...(wctx.sessionId === undefined ? {} : { sessionId: wctx.sessionId }),
       }
     }
 
     async function verifyFileCandidates(file, meta, result, sessionId, signal) {
-      // 兼容尚未重启的旧 Host：metadata 的唯一候选也必须经过内容指纹。
-      if (result.status === 'found') result = { status: 'sample-required', candidates: [result.path], challenge: result.challenge }
       if (result.status !== 'sample-required') return result
       result = await locateRequest({
         phase: 'sample',
@@ -844,7 +894,7 @@ window.__ModuleLoader__.load({
       let result = await verifyFileCandidates(file, meta, metadata, sessionId, signal)
       if (result.status !== 'not-found') return result
 
-      // 排除已通过元数据但内容不匹配的候选；旧 Host 仍通过排除当前根兼容重试。
+      // 排除内容不匹配的候选和当前根，再在可信搜索范围内查找嵌套原件。
       const retryContext = currentWorkspacePath === undefined ? wctx : retryWorkspaceContext(wctx, currentWorkspacePath)
       result = await locateRequest({
         phase: 'metadata', file: meta, ...retryContext,
@@ -854,7 +904,6 @@ window.__ModuleLoader__.load({
     }
 
     async function verifyDirectoryCandidates(entry, initial, result, sessionId, signal) {
-      if (result.status === 'found') result = { status: 'directory-structure-required', candidates: [result.path], challenge: result.challenge }
       if (result.status !== 'directory-structure-required') return result
       const meta = { ...initial, structure: await readDirectoryStructure(entry, signal) }
       result = await locateRequest({
@@ -968,6 +1017,21 @@ window.__ModuleLoader__.load({
       }
     }
 
+    function chooseDropAction(mode, options = {}) {
+      const shellPaths = options.shellPaths || []
+      const extractedPaths = options.extractedPaths || []
+      if (mode === 'locate') {
+        const paths = shellPaths.length > 0 ? shellPaths : extractedPaths
+        if (paths.length > 0) return { type: 'insert-paths', paths }
+        if (options.directoryCount > 0) return { type: 'locate-directories' }
+        if (options.fileCount > 0) return { type: 'locate-files' }
+      } else {
+        if (options.directoryCount > 0) return { type: 'upload-directories' }
+        if (options.fileCount > 0) return { type: 'upload-files' }
+      }
+      return { type: 'none' }
+    }
+
     // ---- 组件 ----
 
     // 输入框工具行：回形针按钮（点开文件选择器）
@@ -1004,24 +1068,35 @@ window.__ModuleLoader__.load({
         e.target.value = ''
         if (files.length === 0) return
         cancelCurrent()
-        const handle = operationController()
-        operationHandleRef.current = handle
-        const operationId = ++operationRef.current
-        const snapshot = {
-          ...optsRef.current,
-          mode: currentMode,
-          modeRevision,
-          signal: handle.controller.signal,
-          getDraft: () => optsRef.current.draft,
-        }
-        snapshot.isActive = () => operationRef.current === operationId
-          && !snapshot.signal.aborted
-          && optsRef.current.sessionId === snapshot.sessionId
-          && optsRef.current.inputActions === snapshot.inputActions
-          && currentSessionMatches(props.sessions, snapshot.sessionId)
-          && currentMode === snapshot.mode
-          && modeRevision === snapshot.modeRevision
+        const started = { ...optsRef.current }
+        const modeStatus = statusStore.begin('正在确认拖拽模式…')
         void (async () => {
+          let mode
+          try { mode = await refreshModeForAction() } catch {
+            statusStore.finish(modeStatus, '✗ ' + MODE_READ_ERROR_MESSAGE)
+            return
+          }
+          statusStore.cancel(modeStatus)
+          if (optsRef.current.sessionId !== started.sessionId
+            || optsRef.current.inputActions !== started.inputActions
+            || !currentSessionMatches(props.sessions, started.sessionId)) return
+          const handle = operationController()
+          operationHandleRef.current = handle
+          const operationId = ++operationRef.current
+          const snapshot = {
+            ...started,
+            mode,
+            modeRevision,
+            signal: handle.controller.signal,
+            getDraft: () => optsRef.current.draft,
+          }
+          snapshot.isActive = () => operationRef.current === operationId
+            && !snapshot.signal.aborted
+            && optsRef.current.sessionId === snapshot.sessionId
+            && optsRef.current.inputActions === snapshot.inputActions
+            && currentSessionMatches(props.sessions, snapshot.sessionId)
+            && currentMode === snapshot.mode
+            && modeRevision === snapshot.modeRevision
           try {
             if (snapshot.mode === 'locate') {
               if (files.length > MAX_TOP_LEVEL_FILES) {
@@ -1039,7 +1114,7 @@ window.__ModuleLoader__.load({
               if (directPaths.length > 0) insertPaths(snapshot.inputActions, snapshot.getDraft(), directPaths, snapshot.isActive)
               if (unresolved.length > 0) await processFilesLocate(unresolved, snapshot)
               else statusStore.show('✓ 已获取 ' + directPaths.length + ' 个文件的原始路径')
-            } else await processFiles(files, snapshot)
+            } else await processFilesUpload(files, snapshot)
           } finally {
             handle.release()
             if (operationHandleRef.current === handle) operationHandleRef.current = null
@@ -1155,8 +1230,8 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => {
         // 全部挂在 window 捕获阶段：事件流的第一个节点，先于 DSH 自带的
-        // document 级拖拽图片处理（InputBar intakeImages / DropOverlay）。
-        const hasFiles = (e) => shouldHandleDataTransfer(e.dataTransfer)
+        // document 级原生附件处理（InputBar intakeImages / DropOverlay）。
+        const hasFiles = (e) => shouldHandleDataTransfer(e.dataTransfer, currentMode)
         const claim = (e) => {
           if (selectDropOwner(e, props.sessions) !== ownerRecordRef.current) return false
           if (claimedDropEvents.has(e)) return false
@@ -1174,7 +1249,7 @@ window.__ModuleLoader__.load({
           if (!hasFiles(e) || !claim(e)) return
           e.preventDefault()
           e.stopPropagation()
-          if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
+          if (e.dataTransfer) e.dataTransfer.dropEffect = currentMode === 'locate' ? 'link' : 'copy'
         }
         const onDragLeave = (e) => {
           if (!hasFiles(e)) {
@@ -1244,83 +1319,97 @@ window.__ModuleLoader__.load({
         }
       }
 
-      async function handleDrop(e, extractedPaths) {
-        if (busyRef.current) return
-        const files = Array.from((e.dataTransfer && e.dataTransfer.files) || [])
-
-        // 桌面壳（preload 捕获阶段已解析好磁盘原始路径）
-        const shellPaths = drainShellPaths()
-        if (shellPaths.length > MAX_TOP_LEVEL_FILES) {
-          statusStore.show('✗ 一次最多处理 ' + MAX_TOP_LEVEL_FILES + ' 个路径')
-          return
-        }
-        if (shellPaths.length > 0) {
-          insertPaths(optsRef.current.inputActions, optsRef.current.draft, shellPaths)
-          statusStore.show('✓ 已获取 ' + shellPaths.length + ' 个原始路径（桌面壳）')
-          return
-        }
-
-        // 拖拽自带路径 → 直接取地址，零上传
-        const paths = extractedPaths || extractPaths(e)
-        if (paths.length > MAX_TOP_LEVEL_FILES) {
-          statusStore.show('✗ 一次最多处理 ' + MAX_TOP_LEVEL_FILES + ' 个路径')
-          return
-        }
-        if (paths.length > 0) {
-          insertPaths(optsRef.current.inputActions, optsRef.current.draft, paths)
-          statusStore.show('✓ 已获取 ' + paths.length + ' 个文件路径')
-          return
-        }
-
-        // 目录拖拽 → 按模式走「目录上传」或「目录定位」
-        const dirEntries = getDirectoryEntries(e.dataTransfer && e.dataTransfer.items)
-        if (dirEntries.length > MAX_ROOT_DIRECTORIES) {
-          statusStore.show('✗ 一次最多处理 ' + MAX_ROOT_DIRECTORIES + ' 个目录')
-          return
-        }
-        if (dirEntries.length > 0) {
-          const operation = beginOperation()
-          busyRef.current = true
-          try {
-            for (const dirEntry of dirEntries) {
-              if (!operation.isActive()) break
-              if (operation.mode === 'locate') {
-                await processDirectoryLocate(dirEntry, operation)
-              } else {
-                await processDirectoryUpload(dirEntry, operation)
-              }
-            }
-          } finally {
-            operation.release()
-            if (operationRef.current === operation.id) busyRef.current = false
-          }
-          return
-        }
-
-        // 普通文件 → 按模式走「上传兜底」或「搜索定位」
-        if (files.length === 0) return
+      async function runDropOperation(run) {
         const operation = beginOperation()
         busyRef.current = true
         try {
-          if (operation.mode === 'locate') {
-            await processFilesLocate(files, operation)
-          } else {
-            await processFiles(files, operation)
-          }
+          await run(operation)
         } finally {
           operation.release()
           if (operationRef.current === operation.id) busyRef.current = false
         }
       }
 
+      async function handleDrop(e, extractedPaths) {
+        if (busyRef.current) return
+        const dataTransfer = e.dataTransfer
+        const files = Array.from((dataTransfer && dataTransfer.files) || [])
+        const directories = getDirectoryEntries(dataTransfer && dataTransfer.items)
+        const shellPaths = drainShellPaths()
+        const suppliedPaths = extractedPaths || extractPaths(e)
+        const started = { ...optsRef.current }
+        const modeStatus = statusStore.begin('正在确认拖拽模式…')
+        busyRef.current = true
+        let mode
+        try { mode = await refreshModeForAction() } catch {
+          busyRef.current = false
+          statusStore.finish(modeStatus, '✗ ' + MODE_READ_ERROR_MESSAGE)
+          return
+        }
+        statusStore.cancel(modeStatus)
+        if (optsRef.current.sessionId !== started.sessionId
+          || optsRef.current.inputActions !== started.inputActions
+          || !currentSessionMatches(props.sessions, started.sessionId)) {
+          busyRef.current = false
+          return
+        }
+        busyRef.current = false
+        const action = chooseDropAction(mode, {
+          shellPaths,
+          extractedPaths: suppliedPaths,
+          directoryCount: directories.length,
+          fileCount: files.length,
+        })
+
+        if (action.type === 'insert-paths') {
+          if (action.paths.length > MAX_TOP_LEVEL_FILES) {
+            statusStore.show('✗ 一次最多处理 ' + MAX_TOP_LEVEL_FILES + ' 个路径')
+            return
+          }
+          insertPaths(optsRef.current.inputActions, optsRef.current.draft, action.paths)
+          statusStore.show('✓ 已定位 ' + action.paths.length + ' 个原始路径')
+          return
+        }
+
+        if (action.type.endsWith('-directories')) {
+          if (directories.length > MAX_ROOT_DIRECTORIES) {
+            statusStore.show('✗ 一次最多处理 ' + MAX_ROOT_DIRECTORIES + ' 个目录')
+            return
+          }
+          const locate = action.type === 'locate-directories'
+          await runDropOperation(async (operation) => {
+            for (const directory of directories) {
+              if (!operation.isActive()) break
+              await (locate
+                ? processDirectoryLocate(directory, operation)
+                : processDirectoryUpload(directory, operation))
+            }
+          })
+          return
+        }
+
+        if (action.type.endsWith('-files')) {
+          await runDropOperation((operation) => action.type === 'locate-files'
+            ? processFilesLocate(files, operation)
+            : processFilesUpload(files, operation))
+          return
+        }
+
+        const pathOnly = shellPaths.length > 0 || suppliedPaths.length > 0
+        statusStore.show(mode === 'upload' && pathOnly
+          ? '✗ 上传模式需要可读取的文件或目录内容'
+          : '✗ 未获取到可处理的文件或目录')
+      }
+
       return React.createElement(React.Fragment, null,
         React.createElement('span', { ref: ownerRef, className: 'dsh-drop-owner', 'aria-hidden': true }),
         statusText ? React.createElement('div', { className: 'dsh-drop-status', style: { bottom: statusBottom, left: statusLeft } },
-          statusText.indexOf('正在') === 0 ? React.createElement('span', { className: 'dsh-drop-status-spinner' }) : null,
+          statusText.includes('正在') ? React.createElement('span', { className: 'dsh-drop-status-spinner' }) : null,
           React.createElement('span', { className: 'dsh-drop-status-text' }, statusText)
         ) : null,
         drag ? React.createElement('div', { className: 'dsh-drop-overlay' },
-          React.createElement('div', { className: 'dsh-drop-overlay-inner' }, '松开鼠标，获取文件')
+          React.createElement('div', { className: 'dsh-drop-overlay-inner' },
+            currentMode === 'locate' ? '松开鼠标，定位文件或目录' : '松开鼠标，上传文件或目录')
         ) : null
       )
     }
@@ -1340,28 +1429,39 @@ window.__ModuleLoader__.load({
     function SettingsSection(props) {
       const [mode, setMode] = React.useState(currentMode)
       const [modeMsg, setModeMsg] = React.useState('')
+      const [quotaMiB, setQuotaMiB] = React.useState(String(currentSettings.uploadQuotaMiB))
+      const [quotaEntries, setQuotaEntries] = React.useState(String(currentSettings.uploadQuotaEntries))
+      const [savedQuota, setSavedQuota] = React.useState({
+        mib: currentSettings.uploadQuotaMiB,
+        entries: currentSettings.uploadQuotaEntries,
+      })
+      const [savingQuota, setSavingQuota] = React.useState(false)
+      const [quotaMsg, setQuotaMsg] = React.useState('')
       const [clearing, setClearing] = React.useState(false)
       const [clearMsg, setClearMsg] = React.useState('')
-      const [size, setSize] = React.useState(null)
+      const [usage, setUsage] = React.useState(null)
       React.useEffect(() => {
         let active = true
         const revision = modeRevision
-        refreshSettings().then((m) => {
+        refreshSettings().then((settings) => {
           if (!active || revision !== modeRevision) return
-          currentMode = m
-          setMode(m)
+          adoptSettings(settings)
+          setMode(settings.mode)
+          setQuotaMiB(String(settings.uploadQuotaMiB))
+          setQuotaEntries(String(settings.uploadQuotaEntries))
+          setSavedQuota({ mib: settings.uploadQuotaMiB, entries: settings.uploadQuotaEntries })
         })
         return () => { active = false }
       }, [])
-      const pick = (m) => {
-        abortActiveOperations()
-        statusStore.clear()
-        const revision = ++modeRevision
-        currentMode = m
-        setMode(m)
+      const pick = (nextMode) => {
+        beginModeChange(nextMode)
+        setMode(nextMode)
         setModeMsg('')
-        void writeMode(m).catch((error) => {
-          if (revision === modeRevision) setModeMsg('✗ ' + String((error && error.message) || error))
+        void writeSettings({ mode: nextMode }).then((settings) => {
+          setMode(settings.mode)
+        }).catch((error) => {
+          setMode(currentMode)
+          setModeMsg('✗ ' + String((error && error.message) || error))
         })
       }
       const mountedRef = React.useRef(true)
@@ -1373,99 +1473,67 @@ window.__ModuleLoader__.load({
         cleanupRef.current.controller = undefined
       }
       React.useEffect(() => () => { mountedRef.current = false; cancelCleanup() }, [])
-      const settingsSessionId = () => {
-        try {
-          const snapshot = props.sessions && props.sessions.list && props.sessions.list.getSnapshot()
-          return normalizeSessionId(snapshot && snapshot.current)
-        } catch { return undefined }
-      }
-      // 拉取 .dsh-drops 磁盘占用（host 递归统计）。
-      const loadSize = async (sessionId = settingsSessionId(), generation, signal) => {
+      // 拉取用户目录 ~/.dsh/.dsh-drops 的实际磁盘占用。
+      const loadSize = async (generation, signal) => {
         const requestId = ++sizeRequestRef.current
         const canCommit = () => mountedRef.current
           && requestId === sizeRequestRef.current
-          && settingsSessionId() === sessionId
           && (generation === undefined || cleanupRef.current.generation === generation)
         try {
-          const response = await fetch(API_PATH + '/size', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify(sessionId === undefined ? {} : { sessionId }),
-            signal,
-          })
-          const data = await response.json().catch(() => ({}))
-          if (canCommit()) setSize(response.ok && typeof data.size === 'number' ? data.size : null)
+          const { response, data } = await readUserUploadUsage(signal)
+          if (canCommit()) {
+            setUsage(response.ok && typeof data.size === 'number' && typeof data.entries === 'number'
+              ? { size: data.size, entries: data.entries } : null)
+          }
           return response.ok ? data : undefined
         } catch {
-          if (canCommit() && (!signal || !signal.aborted)) setSize(null)
+          if (canCommit() && (!signal || !signal.aborted)) setUsage(null)
           return undefined
         }
       }
-      const waitForCleanup = async (sessionId, generation, signal) => {
-        const canCommit = () => mountedRef.current
-          && cleanupRef.current.generation === generation
-          && settingsSessionId() === sessionId
+      const waitForCleanup = async (generation, signal) => {
+        const canCommit = () => mountedRef.current && cleanupRef.current.generation === generation
         for (let attempt = 0; attempt < 20 && canCommit(); attempt += 1) {
           await abortableDelay(500, signal)
           if (!canCommit()) return
-          const state = await loadSize(sessionId, generation, signal)
+          const state = await loadSize(generation, signal)
           if (!canCommit()) return
           if (!state) continue
           if (state.cleanupError) {
-            setClearMsg('⚠ 已从工作区移除，但磁盘清理失败：' + state.cleanupError)
+            setClearMsg('⚠ 已从用户上传目录移除，但磁盘清理失败：' + state.cleanupError)
             return
           }
-          if (!state.cleanupPending && state.size === 0) {
-            setClearMsg('✓ 已清空上传目录')
+          if (!state.cleanupPending && state.size === 0 && state.entries === 0) {
+            setClearMsg('✓ 已清空用户上传目录，容量与条目累计已重置为 0')
             return
           }
         }
-        if (canCommit()) setClearMsg('✓ 已清空上传目录（磁盘清理仍在进行）')
+        if (canCommit()) setClearMsg('磁盘清理仍在进行，容量与条目累计尚未归零')
       }
       React.useEffect(() => { void loadSize() }, [])
-      React.useEffect(() => {
-        const store = props.sessions && props.sessions.list
-        if (!store || typeof store.subscribe !== 'function') return undefined
-        let currentSessionId = settingsSessionId()
-        return store.subscribe(() => {
-          const nextSessionId = settingsSessionId()
-          if (nextSessionId === currentSessionId) return
-          currentSessionId = nextSessionId
-          cancelCleanup()
-          setClearing(false)
-          setClearMsg('')
-          void loadSize(nextSessionId)
-        })
-      }, [props.sessions])
-      // 清空上传目录：删除当前会话工作区（或回退）下的 .dsh-drops
+      // 清空用户目录 ~/.dsh/.dsh-drops，与当前会话工作区无关。
       const clearDrops = async () => {
         if (cleanupRef.current.controller) return
         cancelCleanup()
         const generation = cleanupRef.current.generation
         const controller = new AbortController()
         cleanupRef.current.controller = controller
-        const sessionId = settingsSessionId()
         const canCommit = () => mountedRef.current
           && cleanupRef.current.generation === generation
           && cleanupRef.current.controller === controller
-          && settingsSessionId() === sessionId
         setClearing(true)
         setClearMsg('')
         try {
-          const response = await fetch(API_PATH + '/clear', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify(sessionId === undefined ? { global: true } : { sessionId }),
-            signal: controller.signal,
-          })
-          const data = await response.json().catch(() => ({}))
+          const { response, data } = await clearUserUploadRoot(controller.signal)
           if (!canCommit()) return
           if (response.ok) {
             setClearMsg(data.cleanupError
-              ? '⚠ 已从工作区移除，但磁盘清理失败：' + data.cleanupError
-              : data.cleanupPending ? '✓ 已清空上传目录（磁盘清理中）' : '✓ 已清空上传目录')
-            if (data.cleanupPending) await waitForCleanup(sessionId, generation, controller.signal)
-            else await loadSize(sessionId, generation, controller.signal)
+              ? '⚠ 已从用户上传目录移除，但磁盘清理失败：' + data.cleanupError
+              : data.cleanupPending
+                ? '已从用户上传目录移除，正在重置容量与条目累计'
+                : '✓ 用户上传目录容量与条目累计已重置为 0')
+            if (data.cleanupPending) await waitForCleanup(generation, controller.signal)
+            else await loadSize(generation, controller.signal)
           } else {
             setClearMsg('✗ 清空失败：' + (data.error || 'HTTP ' + response.status))
           }
@@ -1480,42 +1548,114 @@ window.__ModuleLoader__.load({
           }
         }
       }
+      const parsedQuotaMiB = Number(quotaMiB)
+      const parsedQuotaEntries = Number(quotaEntries)
+      const quotaValid = Number.isSafeInteger(parsedQuotaMiB) && parsedQuotaMiB >= 1
+        && parsedQuotaMiB <= MAX_UPLOAD_QUOTA_MIB
+        && Number.isSafeInteger(parsedQuotaEntries) && parsedQuotaEntries >= 1
+        && parsedQuotaEntries <= MAX_UPLOAD_QUOTA_ENTRIES
+      const quotaReached = usage
+        && (usage.size >= savedQuota.mib * MIB_BYTES || usage.entries >= savedQuota.entries)
+      const saveQuota = async () => {
+        if (!quotaValid || savingQuota) {
+          setQuotaMsg('✗ 容量须为 1–1048576 MiB，条目须为 1–100000 的整数')
+          return
+        }
+        setSavingQuota(true)
+        setQuotaMsg('')
+        try {
+          const saved = await writeSettings({
+            uploadQuotaMiB: parsedQuotaMiB,
+            uploadQuotaEntries: parsedQuotaEntries,
+          })
+          if (!mountedRef.current) return
+          setQuotaMiB(String(saved.uploadQuotaMiB))
+          setQuotaEntries(String(saved.uploadQuotaEntries))
+          setSavedQuota({ mib: saved.uploadQuotaMiB, entries: saved.uploadQuotaEntries })
+          setQuotaMsg('✓ 配额已保存')
+        } catch (error) {
+          if (mountedRef.current) setQuotaMsg('✗ ' + String((error && error.message) || error))
+        } finally {
+          if (mountedRef.current) setSavingQuota(false)
+        }
+      }
       return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: '10px' } },
         React.createElement('div', { style: { fontWeight: 600 } }, '拖拽文件处理方式'),
         React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
           React.createElement('input', { type: 'radio', name: 'dsh-file-drop-mode', checked: mode === 'upload', onChange: () => pick('upload') }),
-          React.createElement('span', null, '上传模式（.dsh-drops，稳定可靠）')
+          React.createElement('span', null, '上传模式（复制文件和目录）')
         ),
-        modeMsg ? React.createElement('div', { className: 'dsh-mode-msg' }, modeMsg) : null,
-        React.createElement('div', { className: 'dsh-clear-row' },
-          React.createElement('button', {
-            type: 'button',
-            className: 'dsh-clear-btn',
-            disabled: clearing,
-            onClick: () => void clearDrops(),
-          },
-            clearing
+        mode === 'upload' ? React.createElement('div', { className: 'dsh-upload-settings' },
+          React.createElement('div', { className: 'dsh-quota-row' },
+            React.createElement('label', { className: 'dsh-quota-field' },
+              React.createElement('span', null, '容量上限'),
+              React.createElement('span', { className: 'dsh-quota-input-wrap' },
+                React.createElement('input', {
+                  type: 'number', min: 1, max: MAX_UPLOAD_QUOTA_MIB, step: 1,
+                  value: quotaMiB, 'aria-label': '上传容量上限（MiB）',
+                  onChange: (event) => { setQuotaMiB(event.target.value); setQuotaMsg('') },
+                }),
+                React.createElement('span', null, 'MiB')
+              )
+            ),
+            React.createElement('label', { className: 'dsh-quota-field' },
+              React.createElement('span', null, '条目上限'),
+              React.createElement('span', { className: 'dsh-quota-input-wrap' },
+                React.createElement('input', {
+                  type: 'number', min: 1, max: MAX_UPLOAD_QUOTA_ENTRIES, step: 1,
+                  value: quotaEntries, 'aria-label': '上传条目上限',
+                  onChange: (event) => { setQuotaEntries(event.target.value); setQuotaMsg('') },
+                }),
+                React.createElement('span', null, '条目')
+              )
+            ),
+            React.createElement('button', {
+              type: 'button', className: 'dsh-clear-btn', disabled: savingQuota,
+              onClick: () => void saveQuota(),
+            }, savingQuota ? '保存中...' : '保存配额')
+          ),
+          quotaMsg ? React.createElement('div', { className: 'dsh-quota-msg' }, quotaMsg) : null,
+          React.createElement('div', { className: 'dsh-usage-row' },
+            React.createElement('span', { className: 'dsh-clear-size' }, usage
+              ? '用户目录累计：' + formatSize(usage.size) + ' / ' + formatSize(savedQuota.mib * MIB_BYTES)
+                + '；' + usage.entries + ' / ' + savedQuota.entries + ' 条目'
+              : '用户目录累计：未知'),
+            React.createElement('button', {
+              type: 'button', className: 'dsh-clear-btn', disabled: clearing,
+              onClick: () => void clearDrops(),
+            }, clearing
               ? React.createElement(React.Fragment, null,
                   React.createElement('span', { className: 'dsh-clear-spinner', 'aria-hidden': true }),
-                  '删除中...'
+                  '重置中...'
                 )
-              : '清空上传目录'
+              : '清空并重置累计'),
+            clearMsg ? React.createElement('span', { className: 'dsh-clear-msg' }, clearMsg) : null
           ),
-          React.createElement('span', { className: 'dsh-clear-size' }, '当前占用：' + formatSize(size)),
-          clearMsg ? React.createElement('span', { className: 'dsh-clear-msg' }, clearMsg) : null
-        ),
+          quotaReached ? React.createElement('div', { className: 'dsh-quota-warning' }, QUOTA_ERROR_MESSAGE) : null
+        ) : null,
         React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
           React.createElement('input', { type: 'radio', name: 'dsh-file-drop-mode', checked: mode === 'locate', onChange: () => pick('locate') }),
-          React.createElement('span', null, '定位模式（零拷贝，文件须在可搜索范围内）')
-        )
+          React.createElement('span', null, '定位模式（只定位，不复制）')
+        ),
+        modeMsg ? React.createElement('div', { className: 'dsh-mode-msg' }, modeMsg) : null
       )
     }
 
     const CSS = `
       .dsh-drop-owner { display: none; }
-      .dsh-clear-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding-left: 24px; }
-      .dsh-mode-msg, .dsh-clear-msg { overflow-wrap: anywhere; }
+      .dsh-upload-settings { display: flex; flex-direction: column; gap: 8px; padding-left: 24px; min-width: 0; }
+      .dsh-quota-row { display: grid; grid-template-columns: minmax(150px, 220px) minmax(150px, 220px) auto; align-items: end; gap: 8px; }
+      .dsh-quota-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; font-size: 12px; color: var(--dsw-alias-label-secondary, rgba(255,255,255,0.68)); }
+      .dsh-quota-input-wrap { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; height: 30px; overflow: hidden; border: 1px solid var(--dsw-alias-border-l2-darkmode-thin, rgba(255,255,255,0.15)); border-radius: 6px; background: var(--dsw-alias-bg-input, rgba(128,128,128,0.08)); }
+      .dsh-quota-input-wrap:focus-within { border-color: var(--dsw-alias-interactive-primary, #4f8cff); }
+      .dsh-quota-input-wrap input { width: 100%; min-width: 0; height: 100%; padding: 0 8px; border: 0; outline: 0; background: transparent; color: var(--dsw-alias-label-primary, inherit); font: inherit; }
+      .dsh-quota-input-wrap span { padding: 0 8px; white-space: nowrap; color: var(--dsw-alias-label-secondary, rgba(255,255,255,0.58)); }
+      .dsh-usage-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+      .dsh-mode-msg, .dsh-quota-msg, .dsh-clear-msg, .dsh-quota-warning { overflow-wrap: anywhere; }
       .dsh-mode-msg { padding-left: 24px; font-size: 12px; color: var(--dsw-alias-label-error, #d92d20); }
+      .dsh-quota-msg, .dsh-clear-msg { font-size: 12px; line-height: 1.4; color: var(--dsw-alias-label-secondary, rgba(255,255,255,0.6)); }
+      .dsh-quota-warning { font-size: 12px; line-height: 1.4; color: var(--dsw-alias-label-error, #d92d20); }
+      @media (max-width: 640px) { .dsh-quota-row { grid-template-columns: minmax(0, 1fr); align-items: stretch; } }
       .dsh-clear-btn {
         display: inline-flex; align-items: center; gap: 6px;
         height: 28px; padding: 0 12px;
@@ -1538,10 +1678,6 @@ window.__ModuleLoader__.load({
         animation: dshClearSpin 0.8s linear infinite;
       }
       @keyframes dshClearSpin { to { transform: rotate(360deg); } }
-      .dsh-clear-msg {
-        font-size: 12px; line-height: 1.4;
-        color: var(--dsw-alias-label-secondary, rgba(255,255,255,0.6));
-      }
       .dsh-clear-size {
         font-size: 12px; line-height: 1.4;
         color: var(--dsw-alias-label-secondary, rgba(255,255,255,0.6));
@@ -1636,12 +1772,17 @@ window.__ModuleLoader__.load({
 
     const inject = ['slots', 'workspaces', 'sessions']
 
-    function apply(ctx) {
-      // 初始化当前模式；用户已切换时忽略较早的异步读取结果。
-      const revision = modeRevision
-      refreshSettings().then((m) => {
-        if (revision === modeRevision) currentMode = m
-      })
+    async function apply(ctx) {
+      // 注册任何文件入口前先确认模式；失败时按定位模式接管并禁止上传。
+      try {
+        const settings = await readSettings(undefined, false)
+        currentSettings = settings
+        currentMode = settings.mode
+        settingsLoaded = true
+      } catch {
+        currentMode = 'locate'
+        settingsLoaded = false
+      }
 
       ctx.effect(() => {
         const style = document.createElement('style')
@@ -1684,13 +1825,22 @@ window.__ModuleLoader__.load({
     }
 
     exports.__test = {
-      uploadPayload,
+      uploadChunked,
+      uploadFileChunks,
+      processFilesUpload,
+      processDirectoryUpload,
       readEntryAll,
       statusStore,
       chooseDropOwner,
-      refreshUploadCapability,
-      capabilitySnapshot: () => ({ uploadProtocolVersion, uploadProtocolKnown }),
-      workspacePathKey,
+      chooseDropAction,
+      refreshSettings,
+      refreshModeForAction,
+      beginModeChange,
+      readUserUploadUsage,
+      clearUserUploadRoot,
+      writeSettings,
+      fileUriToPath,
+      retryWorkspaceContext,
       shouldHandleDataTransfer,
     }
     exports.inject = inject

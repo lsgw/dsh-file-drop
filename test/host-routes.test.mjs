@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Readable } from 'node:stream'
-import { mkdtemp, mkdir, readFile, rm, stat, symlink } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { apply, createPathLock } from '../index.js'
+import { apply, applyForTest, createPathLock } from '../index.js'
 
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), 'dsh-file-drop-routes-'))
@@ -13,7 +13,7 @@ async function fixture(t) {
   return root
 }
 
-async function createRoutes(cwd) {
+async function createRoutes(cwd, options) {
   const routes = new Map()
   const ctx = {
     sessions: {
@@ -26,9 +26,28 @@ async function createRoutes(cwd) {
     },
     effect(register) { return register() },
   }
-  await apply(ctx)
+  await applyForTest(ctx, join(cwd, '.dsh-file-drop-test-settings.json'), {
+    ...options,
+    uploadBaseDir: options && options.uploadBaseDir ? options.uploadBaseDir : cwd,
+  })
   return routes
 }
+
+test('production apply reads only declared Cordis injections', async () => {
+  const target = {
+    sessions: { get() {}, list: () => [] },
+    logger: { warn() {} },
+    webServer: { register() { return () => {} } },
+    effect(register) { return register() },
+  }
+  const ctx = new Proxy(target, {
+    get(object, property) {
+      if (!Reflect.has(object, property)) throw new Error('cannot get property "' + String(property) + '" without inject')
+      return Reflect.get(object, property)
+    },
+  })
+  await apply(ctx)
+})
 
 async function callRoute(routes, path, options = {}) {
   const raw = options.raw !== undefined
@@ -57,6 +76,36 @@ async function callRoute(routes, path, options = {}) {
   return { status, headers, json, body: responseBody.toString('utf8') }
 }
 
+const UPLOAD_PATH = '/api/dsh-file-drop/upload'
+const CHUNK_BYTES = 4 * 1024 * 1024
+
+async function initUpload(routes, body) {
+  return callRoute(routes, UPLOAD_PATH + '/init', { body })
+}
+
+async function writeChunk(routes, uploadId, fileIndex, offset, data, options = {}) {
+  return callRoute(routes, UPLOAD_PATH + '/chunk', {
+    raw: data,
+    contentType: options.contentType || 'application/octet-stream',
+    headers: {
+      'x-dsh-upload-id': uploadId,
+      'x-dsh-file-index': String(fileIndex),
+      'x-dsh-upload-offset': String(offset),
+      'x-dsh-session-scope': options.global ? 'global' : 'session',
+      ...(options.global ? {} : { 'x-dsh-session-id': encodeURIComponent(options.sessionId || 'valid') }),
+      ...(options.contentLength === false ? {} : { 'content-length': String(data.length) }),
+    },
+  })
+}
+
+async function finishUpload(routes, sessionId, uploadId) {
+  return callRoute(routes, UPLOAD_PATH + '/finish', { body: { sessionId, uploadId } })
+}
+
+async function cancelUpload(routes, sessionId, uploadId) {
+  return callRoute(routes, UPLOAD_PATH + '/cancel', { body: { sessionId, uploadId } })
+}
+
 
 
 test('path lock serializes aliases of the same physical workspace', async (t) => {
@@ -83,112 +132,253 @@ test('path lock serializes aliases of the same physical workspace', async (t) =>
   assert.equal(maxActive, 1)
 })
 
-test('Host routes return precise request errors', async (t) => {
+test('Host upload routes enforce method, origin and content type boundaries', async (t) => {
   const root = await fixture(t)
   const routes = await createRoutes(root)
-  assert.equal((await callRoute(routes, '/api/dsh-file-drop', { raw: '{' })).status, 400)
-  assert.equal((await callRoute(routes, '/api/dsh-file-drop', { body: {}, contentType: 'text/plain' })).status, 415)
-  assert.equal((await callRoute(routes, '/api/dsh-file-drop', { body: {}, origin: 'https://evil.example' })).status, 403)
-  assert.equal((await callRoute(routes, '/api/dsh-file-drop', { body: {}, method: 'GET' })).status, 405)
+  const initPath = UPLOAD_PATH + '/init'
+  assert.equal((await callRoute(routes, initPath, { raw: '{' })).status, 400)
+  assert.equal((await callRoute(routes, initPath, { body: {}, contentType: 'text/plain' })).status, 415)
+  assert.equal((await callRoute(routes, initPath, { body: {}, origin: 'https://evil.example' })).status, 403)
+  assert.equal((await callRoute(routes, initPath, { body: {}, method: 'GET' })).status, 405)
+  assert.equal((await callRoute(routes, UPLOAD_PATH + '/chunk', { raw: Buffer.from('x') })).status, 415)
   assert.equal((await callRoute(routes, '/api/dsh-file-drop/settings', { method: 'PUT', body: {} })).status, 405)
+  assert.equal(routes.has('/api/dsh-file-drop'), false)
+  assert.equal(routes.has('/api/dsh-file-drop/dir'), false)
 })
 
-
-
-test('settings advertises upload protocol and rejects invalid modes', async (t) => {
+test('settings persists the complete latest mode and quota schema', async (t) => {
   const root = await fixture(t)
   const routes = await createRoutes(root)
   const settings = await callRoute(routes, '/api/dsh-file-drop/settings', { method: 'GET' })
   assert.equal(settings.status, 200)
-  assert.equal(settings.json.uploadProtocolVersion, 2)
-  const invalid = await callRoute(routes, '/api/dsh-file-drop/settings', { body: { mode: 'typo' } })
-  assert.equal(invalid.status, 400)
+  assert.deepEqual(settings.json, {
+    mode: 'upload',
+    uploadQuotaMiB: 10000,
+    uploadQuotaEntries: 10000,
+  })
+  assert.equal((await callRoute(routes, '/api/dsh-file-drop/settings', { body: {} })).status, 400)
+  assert.equal((await callRoute(routes, '/api/dsh-file-drop/settings', {
+    body: { mode: 'upload', uploadQuotaMiB: 10000, uploadQuotaEntries: 10000 },
+  })).status, 400)
+  const located = await callRoute(routes, '/api/dsh-file-drop/settings', { body: { mode: 'locate' } })
+  assert.equal(located.status, 200)
+  const saved = await callRoute(routes, '/api/dsh-file-drop/settings', {
+    body: { uploadQuotaMiB: 64, uploadQuotaEntries: 77 },
+  })
+  assert.equal(saved.status, 200)
+  assert.equal(saved.json.mode, 'locate')
+  assert.equal(saved.json.uploadQuotaMiB, 64)
+  assert.equal(saved.json.uploadQuotaEntries, 77)
+  assert.deepEqual((await callRoute(routes, '/api/dsh-file-drop/settings', { method: 'GET' })).json, saved.json)
 })
 
-test('invalid explicit sessions never fall back to DSH_HOME', async (t) => {
+test('concurrent mode and quota patches cannot overwrite each other across tabs', async (t) => {
   const root = await fixture(t)
   const routes = await createRoutes(root)
-  const payload = { sessionId: 'missing', name: 'x.txt', size: 1, kind: 'text', content: 'x' }
-  const upload = await callRoute(routes, '/api/dsh-file-drop', { body: payload })
+  const [modeResult, quotaResult] = await Promise.all([
+    callRoute(routes, '/api/dsh-file-drop/settings', { body: { mode: 'locate' } }),
+    callRoute(routes, '/api/dsh-file-drop/settings', { body: { uploadQuotaMiB: 222, uploadQuotaEntries: 333 } }),
+  ])
+  assert.equal(modeResult.status, 200)
+  assert.equal(quotaResult.status, 200)
+  assert.deepEqual((await callRoute(routes, '/api/dsh-file-drop/settings', { method: 'GET' })).json, {
+    mode: 'locate', uploadQuotaMiB: 222, uploadQuotaEntries: 333,
+  })
+})
+
+test('corrupt settings fail closed and cannot enable an upload', async (t) => {
+  const root = await fixture(t)
+  const routes = await createRoutes(root)
+  await writeFile(join(root, '.dsh-file-drop-test-settings.json'), '{', 'utf8')
+  assert.equal((await callRoute(routes, '/api/dsh-file-drop/settings', { method: 'GET' })).status, 500)
+  const blocked = await initUpload(routes, { sessionId: 'valid', kind: 'file', name: 'blocked.txt', size: 1 })
+  assert.equal(blocked.status, 500)
+  await assert.rejects(stat(join(root, '.dsh-drops')), (error) => error.code === 'ENOENT')
+})
+
+test('locate mode rejects file and directory upload before staging is created', async (t) => {
+  const root = await fixture(t)
+  const routes = await createRoutes(root)
+  await callRoute(routes, '/api/dsh-file-drop/settings', {
+    body: { mode: 'locate' },
+  })
+  for (const payload of [
+    { sessionId: 'valid', kind: 'file', name: 'blocked.txt', size: 1 },
+    { sessionId: 'valid', kind: 'directory', name: 'blocked-dir', entries: [] },
+  ]) {
+    const blocked = await initUpload(routes, payload)
+    assert.equal(blocked.status, 409)
+    assert.equal(blocked.json.code, 'locate_mode')
+    assert.equal(blocked.json.error, '当前为定位模式，未上传')
+  }
+  await assert.rejects(stat(join(root, '.dsh-drops')), (error) => error.code === 'ENOENT')
+})
+
+test('switching to locate mode cancels active staging before settings save completes', async (t) => {
+  const root = await fixture(t)
+  const routes = await createRoutes(root)
+  const active = await initUpload(routes, { sessionId: 'valid', kind: 'file', name: 'active.bin', size: 3 })
+  assert.equal(active.status, 200)
+  const located = await callRoute(routes, '/api/dsh-file-drop/settings', {
+    body: { mode: 'locate' },
+  })
+  assert.equal(located.status, 200)
+  assert.equal((await writeChunk(routes, active.json.uploadId, 0, 0, Buffer.from('abc'))).status, 404)
+  await assert.rejects(stat(join(root, '.dsh-drops', '.dsh-upload-staging')), (error) => error.code === 'ENOENT')
+  const usage = await callRoute(routes, '/api/dsh-file-drop/size', { body: {} })
+  assert.equal(usage.json.size, 0)
+  assert.equal(usage.json.entries, 0)
+})
+
+test('locate mode save succeeds and stays authoritative when staging deletion must retry', async (t) => {
+  const root = await fixture(t)
+  const routes = await createRoutes(root, { uploadManager: {
+    removeStage: async () => { throw Object.assign(new Error('staging locked'), { code: 'EPERM' }) },
+  } })
+  const initialized = await initUpload(routes, { sessionId: 'valid', kind: 'file', name: 'locked.bin', size: 0 })
+  assert.equal(initialized.status, 200)
+  const changed = await callRoute(routes, '/api/dsh-file-drop/settings', { body: { mode: 'locate' } })
+  assert.equal(changed.status, 200)
+  assert.equal(changed.json.mode, 'locate')
+  assert.equal((await finishUpload(routes, 'valid', initialized.json.uploadId)).status, 409)
+  const readBack = await callRoute(routes, '/api/dsh-file-drop/settings', { method: 'GET', contentType: false })
+  assert.equal(readBack.status, 200)
+  assert.equal(readBack.json.mode, 'locate')
+})
+
+test('size reclaims restart-orphaned staging while locate mode remains active', async (t) => {
+  const root = await fixture(t)
+  const routes = await createRoutes(root)
+  await callRoute(routes, '/api/dsh-file-drop/settings', { body: { mode: 'locate' } })
+  const orphan = join(root, '.dsh-drops', '.dsh-upload-staging', 'orphan.stage')
+  await mkdir(orphan, { recursive: true })
+  await writeFile(join(orphan, 'partial.bin'), 'partial')
+  const usage = await callRoute(routes, '/api/dsh-file-drop/size', { body: {} })
+  assert.equal(usage.status, 200)
+  assert.equal(usage.json.size, 0)
+  assert.equal(usage.json.entries, 0)
+  await assert.rejects(stat(join(root, '.dsh-drops', '.dsh-upload-staging')), (error) => error.code === 'ENOENT')
+})
+
+test('configured byte and entry quotas reject init with a cleanup prompt', async (t) => {
+  const root = await fixture(t)
+  const routes = await createRoutes(root)
+  await callRoute(routes, '/api/dsh-file-drop/settings', {
+    body: { uploadQuotaMiB: 1, uploadQuotaEntries: 2 },
+  })
+  const oversized = await initUpload(routes, {
+    sessionId: 'valid', kind: 'file', name: 'large.bin', size: 1024 * 1024 + 1,
+  })
+  assert.equal(oversized.status, 413)
+  assert.equal(oversized.json.code, 'quota_exceeded')
+  assert.equal(oversized.json.error, '已达上传配额，需清理 .dsh-drops')
+
+  await callRoute(routes, '/api/dsh-file-drop/settings', {
+    body: { uploadQuotaMiB: 1, uploadQuotaEntries: 1 },
+  })
+  const tooManyEntries = await initUpload(routes, {
+    sessionId: 'valid', kind: 'file', name: 'entry.bin', size: 0,
+  })
+  assert.equal(tooManyEntries.status, 413)
+  assert.equal(tooManyEntries.json.code, 'quota_exceeded')
+})
+
+test('invalid explicit sessions are rejected before touching the user upload root', async (t) => {
+  const root = await fixture(t)
+  const routes = await createRoutes(root)
+  const payload = { sessionId: 'missing', name: 'x.txt', size: 1, kind: 'file' }
+  const upload = await initUpload(routes, payload)
   assert.equal(upload.status, 404)
   assert.match(upload.json.error, /session not found/)
   for (const sessionId of [null, '', '   ', 7]) {
-    const invalid = await callRoute(routes, '/api/dsh-file-drop', {
-      body: { sessionId, name: 'x.txt', size: 1, kind: 'text', content: 'x' },
-    })
+    const invalid = await initUpload(routes, { sessionId, name: 'x.txt', size: 1, kind: 'file' })
     assert.equal(invalid.status, 400)
     assert.equal((await callRoute(routes, '/api/dsh-file-drop/clear', { body: { sessionId } })).status, 400)
   }
   assert.equal((await callRoute(routes, '/api/dsh-file-drop/clear', { body: {} })).status, 400)
-  const clear = await callRoute(routes, '/api/dsh-file-drop/clear', { body: { sessionId: 'missing' } })
-  assert.equal(clear.status, 404)
-  const size = await callRoute(routes, '/api/dsh-file-drop/size', { body: { sessionId: 'missing' } })
-  assert.equal(size.status, 404)
+  assert.equal((await callRoute(routes, '/api/dsh-file-drop/clear', { body: { sessionId: 'valid', global: true } })).status, 400)
+  assert.equal((await callRoute(routes, '/api/dsh-file-drop/clear', { body: { global: true, extra: true } })).status, 400)
+  assert.equal((await callRoute(routes, '/api/dsh-file-drop/clear', { body: { sessionId: 'missing' } })).status, 400)
+  assert.equal((await callRoute(routes, '/api/dsh-file-drop/size', { body: { sessionId: 'missing' } })).status, 400)
+  assert.equal((await callRoute(routes, '/api/dsh-file-drop/size', { body: { sessionId: 'valid' } })).status, 400)
+  await assert.rejects(stat(join(root, '.dsh-drops')), (error) => error.code === 'ENOENT')
 })
 
-test('single-file route validates and writes decoded bytes', async (t) => {
+test('single-file upload streams exact chunks and numbers duplicate names', async (t) => {
   const root = await fixture(t)
   const routes = await createRoutes(root)
-  const text = await callRoute(routes, '/api/dsh-file-drop', {
-    body: { sessionId: 'valid', name: 'note.txt', size: 6, kind: 'text', content: '中文' },
-  })
+  const first = await initUpload(routes, { sessionId: 'valid', kind: 'file', name: 'note.txt', size: 6 })
+  assert.equal(first.status, 200)
+  assert.equal((await writeChunk(routes, first.json.uploadId, 0, 0, Buffer.from('中文'), { sessionId: 'other' })).status, 409)
+  assert.equal((await writeChunk(routes, first.json.uploadId, 0, 0, Buffer.from('中文'))).status, 200)
+  const text = await finishUpload(routes, 'valid', first.json.uploadId)
   assert.equal(text.status, 200)
   assert.equal(await readFile(text.json.path, 'utf8'), '中文')
-  const duplicate = await callRoute(routes, '/api/dsh-file-drop', {
-    body: { sessionId: 'valid', name: 'note.txt', size: 3, kind: 'text', content: 'new' },
-  })
+
+  const second = await initUpload(routes, { sessionId: 'valid', kind: 'file', name: 'note.txt', size: 3 })
+  await writeChunk(routes, second.json.uploadId, 0, 0, Buffer.from('new'))
+  const duplicate = await finishUpload(routes, 'valid', second.json.uploadId)
   assert.equal(duplicate.status, 200)
   assert.notEqual(duplicate.json.path, text.json.path)
   assert.equal(await readFile(text.json.path, 'utf8'), '中文')
   assert.equal(await readFile(duplicate.json.path, 'utf8'), 'new')
 
-  const binary = await callRoute(routes, '/api/dsh-file-drop', {
-    body: { sessionId: 'valid', name: 'data.bin', size: 3, kind: 'binary', base64: 'AAEC' },
-  })
+  const largeSize = 25 * 1024 * 1024 + 3
+  const binaryInit = await initUpload(routes, { sessionId: 'valid', kind: 'file', name: 'large.bin', size: largeSize })
+  for (let offset = 0; offset < largeSize; offset += CHUNK_BYTES) {
+    const length = Math.min(CHUNK_BYTES, largeSize - offset)
+    const data = Buffer.alloc(length, Math.floor(offset / CHUNK_BYTES) + 1)
+    assert.equal((await writeChunk(routes, binaryInit.json.uploadId, 0, offset, data)).status, 200)
+  }
+  const binary = await finishUpload(routes, 'valid', binaryInit.json.uploadId)
   assert.equal(binary.status, 200)
-  assert.deepEqual([...await readFile(binary.json.path)], [0, 1, 2])
+  const stored = await readFile(binary.json.path)
+  assert.equal(stored.length, largeSize)
+  assert.equal(stored[0], 1)
+  assert.equal(stored[CHUNK_BYTES], 2)
+  assert.equal(stored.at(-1), 7)
 
-  const invalid = await callRoute(routes, '/api/dsh-file-drop', {
-    body: { sessionId: 'valid', name: 'bad.bin', size: 3, kind: 'binary', base64: '%%%%' },
+  const oldPayload = await initUpload(routes, {
+    sessionId: 'valid', kind: 'file', name: 'old.bin', size: 1, base64: 'AA==',
   })
-  assert.equal(invalid.status, 400)
-  const mismatched = await callRoute(routes, '/api/dsh-file-drop', {
-    body: { sessionId: 'valid', name: 'short.bin', size: 1, kind: 'binary', base64: 'AAE=' },
-  })
-  assert.equal(mismatched.status, 400)
+  assert.equal(oldPayload.status, 400)
 })
 
-test('directory route enforces Host count and path schema before writing', async (t) => {
+test('directory upload streams each file, preserves empty directories and validates manifests', async (t) => {
   const root = await fixture(t)
   const routes = await createRoutes(root)
-  const valid = await callRoute(routes, '/api/dsh-file-drop/dir', {
-    body: {
-      sessionId: 'valid',
-      dirName: 'folder',
-      entries: [
-        { kind: 'text', path: 'nested/a.txt', content: 'A' },
-        { kind: 'directory', path: 'nested/empty' },
-        { kind: 'binary', path: 'b.bin', base64: 'AAE=' },
-      ],
-    },
+  const valid = await initUpload(routes, {
+    sessionId: 'valid',
+    kind: 'directory',
+    name: 'folder',
+    entries: [
+      { kind: 'file', path: 'nested/a.txt', size: 1 },
+      { kind: 'directory', path: 'nested/empty' },
+      { kind: 'file', path: 'b.bin', size: 2 },
+    ],
   })
   assert.equal(valid.status, 200)
-  assert.equal(await readFile(join(valid.json.path, 'nested', 'a.txt'), 'utf8'), 'A')
-  assert.equal((await stat(join(valid.json.path, 'nested', 'empty'))).isDirectory(), true)
-  const empty = await callRoute(routes, '/api/dsh-file-drop/dir', {
-    body: { sessionId: 'valid', dirName: 'empty-folder', entries: [] },
-  })
-  assert.equal(empty.status, 200)
+  await writeChunk(routes, valid.json.uploadId, 0, 0, Buffer.from('A'))
+  await writeChunk(routes, valid.json.uploadId, 1, 0, Buffer.from([0, 1]))
+  const finished = await finishUpload(routes, 'valid', valid.json.uploadId)
+  assert.equal(finished.status, 200)
+  assert.equal(await readFile(join(finished.json.path, 'nested', 'a.txt'), 'utf8'), 'A')
+  assert.equal((await stat(join(finished.json.path, 'nested', 'empty'))).isDirectory(), true)
 
-  const entries = Array.from({ length: 501 }, (_, index) => ({ kind: 'text', path: 'f' + index, content: '' }))
-  const tooMany = await callRoute(routes, '/api/dsh-file-drop/dir', {
-    body: { sessionId: 'valid', dirName: 'too-many', entries },
+  const empty = await initUpload(routes, { sessionId: 'valid', kind: 'directory', name: 'empty-folder', entries: [] })
+  assert.equal((await finishUpload(routes, 'valid', empty.json.uploadId)).status, 200)
+  const large = await initUpload(routes, {
+    sessionId: 'valid', kind: 'directory', name: 'large-folder',
+    entries: [{ kind: 'file', path: 'large.bin', size: 80 * 1024 * 1024 }],
   })
-  assert.equal(tooMany.status, 413)
-  const traversal = await callRoute(routes, '/api/dsh-file-drop/dir', {
-    body: { sessionId: 'valid', dirName: 'escape', entries: [{ kind: 'text', path: '../x', content: 'x' }] },
-  })
-  assert.equal(traversal.status, 400)
+  assert.equal(large.status, 200)
+  assert.equal((await cancelUpload(routes, 'valid', large.json.uploadId)).json.cancelled, true)
+
+  const entries = Array.from({ length: 501 }, (_, index) => ({ kind: 'file', path: 'f' + index, size: 0 }))
+  assert.equal((await initUpload(routes, { sessionId: 'valid', kind: 'directory', name: 'too-many', entries })).status, 413)
+  assert.equal((await initUpload(routes, {
+    sessionId: 'valid', kind: 'directory', name: 'escape', entries: [{ kind: 'file', path: '../x', size: 1 }],
+  })).status, 400)
 })
 
 
@@ -197,10 +387,10 @@ test('locate route requires protocol v2, valid sessions and challenges', async (
   const root = await fixture(t)
   const routes = await createRoutes(root)
   const file = { kind: 'file', name: 'x.txt', size: 1, lastModified: 1 }
-  const legacy = await callRoute(routes, '/file-drop/locate', {
+  const unsupported = await callRoute(routes, '/file-drop/locate', {
     body: { protocolVersion: 1, phase: 'metadata', file },
   })
-  assert.equal(legacy.status, 426)
+  assert.equal(unsupported.status, 426)
   const invalidSession = await callRoute(routes, '/file-drop/locate', {
     body: { protocolVersion: 2, phase: 'metadata', sessionId: 'missing', file },
   })
@@ -211,26 +401,33 @@ test('locate route requires protocol v2, valid sessions and challenges', async (
   assert.equal(noChallenge.status, 400)
 })
 
-test('size and clear routes use the same valid session root', async (t) => {
-  const root = await fixture(t)
-  const routes = await createRoutes(root)
-  await callRoute(routes, '/api/dsh-file-drop', {
-    body: { sessionId: 'valid', name: 'note.txt', size: 3, kind: 'text', content: 'abc' },
-  })
-  const size = await callRoute(routes, '/api/dsh-file-drop/size', { body: { sessionId: 'valid' } })
+test('upload, size and clear use one user root instead of the session workspace', async (t) => {
+  const workspace = await fixture(t)
+  const uploadRoot = await fixture(t)
+  const routes = await createRoutes(workspace, { uploadBaseDir: uploadRoot })
+  const initialized = await initUpload(routes, { sessionId: 'valid', kind: 'file', name: 'note.txt', size: 3 })
+  await writeChunk(routes, initialized.json.uploadId, 0, 0, Buffer.from('abc'))
+  const finished = await finishUpload(routes, 'valid', initialized.json.uploadId)
+  assert.equal(finished.status, 200)
+  assert.equal(finished.json.path.startsWith(join(uploadRoot, '.dsh-drops')), true)
+  await assert.rejects(stat(join(workspace, '.dsh-drops')), (error) => error.code === 'ENOENT')
+
+  const size = await callRoute(routes, '/api/dsh-file-drop/size', { body: {} })
   assert.equal(size.status, 200)
+  assert.equal(size.json.path, join(uploadRoot, '.dsh-drops'))
   assert.equal(size.json.size, 3)
   assert.equal(size.json.entries, 1)
-  const clear = await callRoute(routes, '/api/dsh-file-drop/clear', { body: { sessionId: 'valid' } })
+  const clear = await callRoute(routes, '/api/dsh-file-drop/clear', { body: { global: true } })
   assert.equal(clear.status, 200)
   assert.equal(clear.json.removed, true)
   assert.equal(typeof clear.json.cleanupPending, 'boolean')
   let after
   for (let attempt = 0; attempt < 20; attempt += 1) {
-    after = await callRoute(routes, '/api/dsh-file-drop/size', { body: { sessionId: 'valid' } })
+    after = await callRoute(routes, '/api/dsh-file-drop/size', { body: {} })
     if (after.status === 200 && !after.json.cleanupPending && after.json.size === 0) break
     await new Promise((resolve) => setTimeout(resolve, 10))
   }
   assert.equal(after.status, 200, after.body)
   assert.equal(after.json.size, 0)
+  assert.equal(after.json.entries, 0)
 })

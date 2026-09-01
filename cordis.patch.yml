@@ -1,4 +1,4 @@
-# dsh-file-drop：拖拽非图片文件（桌面壳直取原始路径 / 上传兜底）
+# dsh-file-drop：上传模式分块复制到用户目录，定位模式获取原始路径
 - insert:
     - id: dsh-file-drop
       name: dsh-file-drop

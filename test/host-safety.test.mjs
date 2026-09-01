@@ -1,27 +1,31 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Readable } from 'node:stream'
-import { mkdtemp, mkdir, readFile, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
+import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 
 import {
   HttpError,
-  MAX_FILE_BYTES,
   assertDropRootCapacity,
+  cleanupOrphanUploadStages,
   clearDropRoot,
-  decodeDirectoryPayload,
-  decodeUploadPayload,
+  commitUploadStage,
+  createUploadStage,
+  decodeUploadManifest,
   dropCleanupStatus,
   errorStatus,
   measureDropRoot,
   readJsonBody,
-  replaceUploadedDirectory,
+  removeUploadStage,
   resolveBaseDir,
   sanitizeName,
-  writeUploadedFile,
+  verifyUploadStage,
+  writeUploadChunk,
 } from '../host-safety.js'
 import { runIsolatedTask } from '../locate/isolate.js'
+import { DEFAULT_UPLOAD_QUOTA_BYTES, QUOTA_ERROR_CODE } from '../settings.js'
 
 async function fixture(t, label) {
   const root = await mkdtemp(join(tmpdir(), 'dsh-file-drop-host-' + label + '-'))
@@ -63,62 +67,80 @@ test('JSON body uses network bytes and strict UTF-8', async () => {
   await rejectsStatus(readJsonBody(requestFrom([Buffer.from('{')]), 100), 400)
 })
 
-test('single-file payload validates metadata, decoded bytes and base64', () => {
-  const text = decodeUploadPayload({ name: 'note.txt', size: 6, kind: 'text', content: '中文' })
-  assert.equal(text.data.length, 6)
-  assert.equal(text.name, 'note.txt')
-  const binary = decodeUploadPayload({ name: 'data.bin', size: 3, kind: 'binary', base64: 'AAEC' })
-  assert.deepEqual([...binary.data], [0, 1, 2])
-  assert.throws(() => decodeUploadPayload({ name: 'x'.repeat(4097), size: 0, kind: 'text', content: '' }), /file name/)
-  assert.throws(() => decodeUploadPayload({ name: 'x', size: -1, kind: 'text', content: '' }), HttpError)
-  assert.throws(() => decodeUploadPayload({ name: 'x', size: MAX_FILE_BYTES + 1, kind: 'text', content: '' }), HttpError)
-  assert.throws(() => decodeUploadPayload({ name: 'x', size: 1, kind: 'binary', base64: '%%%=' }), /invalid base64/)
-  assert.throws(() => decodeUploadPayload({ name: 'x', size: 1, kind: 'text', content: '中文' }), /does not match/)
-  assert.throws(() => decodeUploadPayload({ name: 'x', size: 1, kind: 'binary', base64: 'AAE=' }), /does not match/)
-  assert.throws(() => decodeUploadPayload({ name: 'x', size: 1.5, kind: 'text', content: 'x' }), HttpError)
+test('single-file manifest accepts large files up to the configured user-root quota', () => {
+  const large = decodeUploadManifest({ kind: 'file', name: 'large.bin', size: 128 * 1024 * 1024 })
+  assert.equal(large.totalBytes, 128 * 1024 * 1024)
+  assert.equal(large.files[0].size, large.totalBytes)
+  assert.equal(large.name, 'large.bin')
+  assert.throws(() => decodeUploadManifest({ kind: 'file', name: 'x'.repeat(4097), size: 0 }), /file name/)
+  assert.throws(() => decodeUploadManifest({ kind: 'file', name: 'x', size: -1 }), HttpError)
+  assert.throws(() => decodeUploadManifest({ kind: 'file', name: 'x', size: 1.5 }), HttpError)
+  assert.throws(
+    () => decodeUploadManifest({ kind: 'file', name: 'x', size: DEFAULT_UPLOAD_QUOTA_BYTES + 1 }),
+    (error) => error instanceof HttpError && error.code === QUOTA_ERROR_CODE
+  )
+  assert.throws(() => decodeUploadManifest({ kind: 'file', name: 'x', size: 1, base64: 'AA==' }), /must not contain/)
+  assert.throws(() => decodeUploadManifest({ kind: 'binary', name: 'x', size: 1 }), /upload kind/)
 })
 
-test('directory payload enforces count, depth, paths, kinds and collisions', () => {
-  const entries = Array.from({ length: 500 }, (_, index) => ({ kind: 'text', path: 'f' + index + '.txt', content: '' }))
-  assert.equal(decodeDirectoryPayload('root', []).files.length, 0)
-  assert.deepEqual(decodeDirectoryPayload('root', [{ kind: 'directory', path: 'empty' }]).directories, [['empty']])
-  assert.throws(() => decodeDirectoryPayload('root', [{ kind: 'directory', path: 'empty', content: '' }]), /marker/)
-  assert.throws(() => decodeDirectoryPayload('x'.repeat(4097), []), /directory upload/)
-  assert.equal(decodeDirectoryPayload('root', entries).files.length, 500)
-  assert.throws(() => decodeDirectoryPayload('root', [...entries, { kind: 'text', path: 'extra', content: '' }]), /file-count/)
-  assert.throws(() => decodeDirectoryPayload('root', [{ kind: 'text', path: '../escape', content: '' }]), /entry path/)
-  assert.throws(() => decodeDirectoryPayload('root', [{ kind: 'text', path: 'C:/absolute', content: '' }]), /relative/)
-  assert.throws(() => decodeDirectoryPayload('root', [{ kind: 'other', path: 'x', content: '' }]), /file kind/)
-  assert.throws(() => decodeDirectoryPayload('root', [{ kind: 'binary', path: 'x', size: 1, base64: 'AAE=' }]), /does not match/)
-  assert.throws(() => decodeDirectoryPayload('root', [
-    { kind: 'text', path: 'a?.txt', content: '' },
-    { kind: 'text', path: 'a*.txt', content: '' },
-  ]), /collide/)
-  assert.throws(() => decodeDirectoryPayload('root', [
-    { kind: 'text', path: '\u00e9.txt', content: '' },
-    { kind: 'text', path: 'e\u0301.txt', content: '' },
-  ]), /collide/)
-  assert.throws(() => decodeDirectoryPayload('root', [
-    { kind: 'text', path: 'parent', content: '' },
-    { kind: 'text', path: 'parent/child.txt', content: '' },
-  ]), /collide/)
-  assert.throws(() => decodeDirectoryPayload('root', [
-    { kind: 'text', path: 'a?/first.txt', content: '' },
-    { kind: 'text', path: 'a*/second.txt', content: '' },
-  ]), /collide/)
-  const nested = decodeDirectoryPayload('root', [
-    { kind: 'text', path: 'a/b/first.txt', content: '' },
-    { kind: 'text', path: 'a/b/second.txt', content: '' },
-  ])
+test('directory manifest enforces structure limits independently from configured byte quota', () => {
+  const entries = Array.from({ length: 500 }, (_, index) => ({ kind: 'file', path: 'f' + index + '.txt', size: 0 }))
+  assert.equal(decodeUploadManifest({ kind: 'directory', name: 'root', entries: [] }).files.length, 0)
+  assert.deepEqual(decodeUploadManifest({
+    kind: 'directory', name: 'root', entries: [{ kind: 'directory', path: 'empty' }],
+  }).directories, [['empty']])
+  assert.throws(() => decodeUploadManifest({
+    kind: 'directory', name: 'root', entries: [{ kind: 'directory', path: 'empty', size: 0 }],
+  }), /marker/)
+  assert.throws(() => decodeUploadManifest({ kind: 'directory', name: 'x'.repeat(4097), entries: [] }), /directory name/)
+  assert.equal(decodeUploadManifest({ kind: 'directory', name: 'root', entries }).files.length, 500)
+  assert.throws(() => decodeUploadManifest({
+    kind: 'directory', name: 'root', entries: [...entries, { kind: 'file', path: 'extra', size: 0 }],
+  }), /file-count/)
+  assert.throws(() => decodeUploadManifest({
+    kind: 'directory', name: 'root', entries: [{ kind: 'file', path: '../escape', size: 0 }],
+  }), /entry path/)
+  assert.throws(() => decodeUploadManifest({
+    kind: 'directory', name: 'root', entries: [{ kind: 'file', path: 'C:/absolute', size: 0 }],
+  }), /relative/)
+  assert.throws(() => decodeUploadManifest({
+    kind: 'directory', name: 'root', entries: [{ kind: 'text', path: 'x', size: 0 }],
+  }), /directory entry/)
+  assert.throws(() => decodeUploadManifest({
+    kind: 'directory', name: 'root', entries: [{ kind: 'file', path: 'x', size: 1, content: 'x' }],
+  }), /must not contain/)
+  assert.throws(() => decodeUploadManifest({ kind: 'directory', name: 'root', entries: [
+    { kind: 'file', path: 'a?.txt', size: 0 },
+    { kind: 'file', path: 'a*.txt', size: 0 },
+  ] }), /collide/)
+  assert.throws(() => decodeUploadManifest({ kind: 'directory', name: 'root', entries: [
+    { kind: 'file', path: '\u00e9.txt', size: 0 },
+    { kind: 'file', path: 'e\u0301.txt', size: 0 },
+  ] }), /collide/)
+  assert.throws(() => decodeUploadManifest({ kind: 'directory', name: 'root', entries: [
+    { kind: 'file', path: 'parent', size: 0 },
+    { kind: 'file', path: 'parent/child.txt', size: 0 },
+  ] }), /collide/)
+  assert.throws(() => decodeUploadManifest({ kind: 'directory', name: 'root', entries: [
+    { kind: 'file', path: 'a?/first.txt', size: 0 },
+    { kind: 'file', path: 'a*/second.txt', size: 0 },
+  ] }), /collide/)
+  const nested = decodeUploadManifest({ kind: 'directory', name: 'root', entries: [
+    { kind: 'file', path: 'a/b/first.txt', size: 40 * 1024 * 1024 },
+    { kind: 'file', path: 'a/b/second.txt', size: 40 * 1024 * 1024 },
+  ] })
   assert.equal(nested.entryCount, 5)
+  assert.equal(nested.totalBytes, 80 * 1024 * 1024)
   if (process.platform === 'win32') {
-    assert.throws(() => decodeDirectoryPayload('root', [
-      { kind: 'text', path: 'Case.txt', content: '' },
-      { kind: 'text', path: 'case.txt', content: '' },
-    ]), /collide/)
+    assert.throws(() => decodeUploadManifest({ kind: 'directory', name: 'root', entries: [
+      { kind: 'file', path: 'Case.txt', size: 0 },
+      { kind: 'file', path: 'case.txt', size: 0 },
+    ] }), /collide/)
   }
   const tooDeep = Array.from({ length: 33 }, (_, index) => 'd' + index).join('/')
-  assert.throws(() => decodeDirectoryPayload('root', [{ kind: 'text', path: tooDeep, content: '' }]), /entry path/)
+  assert.throws(() => decodeUploadManifest({
+    kind: 'directory', name: 'root', entries: [{ kind: 'file', path: tooDeep, size: 0 }],
+  }), /entry path/)
 })
 
 
@@ -154,50 +176,81 @@ test('name sanitization handles Windows-invalid and reserved names', () => {
   assert.equal(sanitizeName('😀'.repeat(110) + '.txt').endsWith('.txt'), true)
 })
 
-test('file and directory writes replace atomically and size is bounded', async (t) => {
+test('chunk writes require contiguous exact blocks and preserve retryability', async (t) => {
+  const root = await fixture(t, 'chunks')
+  const base = join(root, 'workspace')
+  await mkdir(base)
+  const stage = await createUploadStage(base, decodeUploadManifest({ kind: 'file', name: 'six.bin', size: 6 }), randomUUID())
+  await rejectsStatus(writeUploadChunk(requestFrom([Buffer.from('abc')]), stage, 0, 0, 4), 400)
+  assert.equal(stage.files[0].written, 0)
+  await writeUploadChunk(requestFrom([Buffer.from('ab'), Buffer.from('cd')], { 'content-length': '4' }), stage, 0, 0, 4)
+  await rejectsStatus(writeUploadChunk(requestFrom([Buffer.from('abcd')], { 'content-length': '4' }), stage, 0, 0, 4), 409)
+  await rejectsStatus(verifyUploadStage(stage), 409)
+  await writeUploadChunk(requestFrom([Buffer.from('ef')], { 'content-length': '2' }), stage, 0, 4, 4)
+  await verifyUploadStage(stage)
+  const path = await commitUploadStage(base, stage)
+  assert.equal(await readFile(path, 'utf8'), 'abcdef')
+})
+
+test('staged file and directory commits are atomic and orphan stages are reclaimed', async (t) => {
   const root = await fixture(t, 'write')
   const base = join(root, 'workspace')
   await mkdir(base)
-  const first = decodeUploadPayload({ name: 'note.txt', size: 3, kind: 'text', content: 'one' })
-  const filePath = await writeUploadedFile(base, first)
-  assert.equal(await readFile(filePath, 'utf8'), 'one')
-  const second = decodeUploadPayload({ name: 'note.txt', size: 3, kind: 'text', content: 'two' })
-  const secondPath = await writeUploadedFile(base, second)
+  const uploadFile = async (name, data) => {
+    const stage = await createUploadStage(base, decodeUploadManifest({ kind: 'file', name, size: data.length }), randomUUID())
+    if (data.length) await writeUploadChunk(requestFrom([data], { 'content-length': String(data.length) }), stage, 0, 0, 16)
+    return commitUploadStage(base, stage)
+  }
+  const filePath = await uploadFile('note.txt', Buffer.from('one'))
+  const secondPath = await uploadFile('note.txt', Buffer.from('two'))
   assert.notEqual(secondPath, filePath)
   assert.equal(await readFile(filePath, 'utf8'), 'one')
   assert.equal(await readFile(secondPath, 'utf8'), 'two')
-  const longName = '😀'.repeat(110) + '.txt'
-  const longPath = await writeUploadedFile(base, decodeUploadPayload({ name: longName, size: 1, kind: 'text', content: 'x' }))
+  const longPath = await uploadFile('😀'.repeat(110) + '.txt', Buffer.from('x'))
   assert.equal(await readFile(longPath, 'utf8'), 'x')
   assert.equal(longPath.endsWith('.txt'), true)
   await rm(longPath)
 
-  const directory = decodeDirectoryPayload('folder', [
-    { kind: 'text', path: 'nested/a.txt', content: 'A' },
+  const directoryManifest = decodeUploadManifest({ kind: 'directory', name: 'folder', entries: [
+    { kind: 'file', path: 'nested/a.txt', size: 1 },
     { kind: 'directory', path: 'nested/empty' },
-    { kind: 'binary', path: 'b.bin', base64: 'AAE=' },
-  ])
-  const directoryPath = await replaceUploadedDirectory(base, directory)
+    { kind: 'file', path: 'b.bin', size: 2 },
+  ] })
+  const directoryStage = await createUploadStage(base, directoryManifest, randomUUID())
+  await writeUploadChunk(requestFrom([Buffer.from('A')], { 'content-length': '1' }), directoryStage, 0, 0, 16)
+  await writeUploadChunk(requestFrom([Buffer.from([0, 1])], { 'content-length': '2' }), directoryStage, 1, 0, 16)
+  const directoryPath = await commitUploadStage(base, directoryStage)
   assert.equal(await readFile(join(directoryPath, 'nested', 'a.txt'), 'utf8'), 'A')
   assert.deepEqual([...await readFile(join(directoryPath, 'b.bin'))], [0, 1])
   assert.equal((await stat(join(directoryPath, 'nested', 'empty'))).isDirectory(), true)
 
-  const backupPath = join(base, '.dsh-drops', '.folder.bak')
-  await rename(directoryPath, backupPath)
-  await assert.rejects(replaceUploadedDirectory(base, {
-    name: 'folder',
-    files: [
-      { segments: ['same.txt'], data: Buffer.from('first') },
-      { segments: ['same.txt'], data: Buffer.from('second') },
-    ],
-  }))
+  const unsafeStage = await createUploadStage(base, decodeUploadManifest({
+    kind: 'directory', name: 'folder', entries: [{ kind: 'file', path: 'new.txt', size: 5 }],
+  }), randomUUID())
+  await writeUploadChunk(requestFrom([Buffer.from('newer')], { 'content-length': '5' }), unsafeStage, 0, 0, 16)
+  await writeFile(unsafeStage.files[0].path, 'bad')
+  await rejectsStatus(commitUploadStage(base, unsafeStage), 409)
   assert.equal(await readFile(join(directoryPath, 'nested', 'a.txt'), 'utf8'), 'A')
+  await removeUploadStage(unsafeStage)
 
-  let clockCalls = 0
-  await rejectsStatus(measureDropRoot(base, { maxDurationMs: 1, now: () => clockCalls++ === 0 ? 0 : 2 }), 503)
+  const replacementStage = await createUploadStage(base, decodeUploadManifest({
+    kind: 'directory', name: 'folder', entries: [{ kind: 'file', path: 'new.txt', size: 3 }],
+  }), randomUUID())
+  await writeUploadChunk(requestFrom([Buffer.from('new')], { 'content-length': '3' }), replacementStage, 0, 0, 16)
+  await commitUploadStage(base, replacementStage)
+  assert.equal(await readFile(join(directoryPath, 'new.txt'), 'utf8'), 'new')
+  await assert.rejects(readFile(join(directoryPath, 'nested', 'a.txt')))
+
+  const orphan = await createUploadStage(base, decodeUploadManifest({ kind: 'file', name: 'orphan.bin', size: 2 }), randomUUID())
+  await cleanupOrphanUploadStages(base, new Set())
+  await assert.rejects(stat(orphan.path))
+
+  for (let attempt = 0; attempt < 20 && dropCleanupStatus(base).cleanupPending; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve))
+  }
   const measured = await measureDropRoot(base)
   assert.equal(measured.size, 9)
-  assert.equal(measured.entries, 7)
+  assert.equal(measured.entries, 4)
 
   await clearDropRoot(base, { waitForCleanup: true })
   assert.deepEqual(await measureDropRoot(base), { path: join(base, '.dsh-drops'), size: 0, entries: 0 })
@@ -206,6 +259,41 @@ test('file and directory writes replace atomically and size is bounded', async (
 
 
 
+
+test('mode rejection immediately before commit leaves no file and restores replaced directories', async (t) => {
+  const root = await fixture(t, 'commit-mode-rejection')
+  const base = join(root, 'workspace')
+  const fileStage = await createUploadStage(
+    base,
+    decodeUploadManifest({ kind: 'file', name: 'blocked.txt', size: 0 }),
+    randomUUID()
+  )
+  await assert.rejects(commitUploadStage(base, fileStage, {
+    beforeCommit() { throw new HttpError(409, '当前为定位模式，未上传', 'locate_mode') },
+  }), (error) => error.code === 'locate_mode')
+  await assert.rejects(stat(join(base, '.dsh-drops', 'blocked.txt')), (error) => error.code === 'ENOENT')
+  await removeUploadStage(fileStage)
+
+  const directoryStage = await createUploadStage(
+    base,
+    decodeUploadManifest({ kind: 'directory', name: 'replace-me', entries: [] }),
+    randomUUID()
+  )
+  const target = join(base, '.dsh-drops', 'replace-me')
+  await mkdir(target)
+  await writeFile(join(target, 'old.txt'), 'old')
+  let checks = 0
+  await assert.rejects(commitUploadStage(base, directoryStage, {
+    beforeCommit() {
+      checks += 1
+      if (checks === 2) throw new HttpError(409, '当前为定位模式，未上传', 'locate_mode')
+    },
+  }), (error) => error.code === 'locate_mode')
+  assert.equal(checks, 2)
+  assert.equal(await readFile(join(target, 'old.txt'), 'utf8'), 'old')
+  await stat(directoryStage.path)
+  await removeUploadStage(directoryStage)
+})
 
 test('clear reports asynchronous quarantine cleanup failures', async (t) => {
   const root = await fixture(t, 'cleanup-failure')
@@ -255,7 +343,7 @@ test('drop-root symlinks or junctions are rejected', async (t) => {
   }
   await rejectsStatus(measureDropRoot(base), 409)
   await rejectsStatus(clearDropRoot(base), 409)
-  await rejectsStatus(writeUploadedFile(base, decodeUploadPayload({ name: 'x', size: 1, kind: 'text', content: 'x' })), 409)
+  await rejectsStatus(createUploadStage(base, decodeUploadManifest({ kind: 'file', name: 'x', size: 1 }), randomUUID()), 409)
   assert.deepEqual(await readdirSafe(target), [])
 })
 
@@ -286,10 +374,10 @@ test('clear never follows stale quarantine links', async (t) => {
 
 test('session resolution distinguishes missing and invalid ids', async (t) => {
   const root = await fixture(t, 'session')
-  const ctx = { sessions: { get: (id) => id === 'valid' ? { header: { cwd: root } }
-    : id === 'legacy' ? { meta: { cwd: root } } : undefined } }
+  const ctx = { sessions: { get: (id) => id === 'valid' ? { header: { cwd: root } } : undefined } }
   assert.equal(resolveBaseDir(ctx, 'valid'), root)
-  assert.equal(resolveBaseDir(ctx, 'legacy'), root)
+  assert.throws(() => resolveBaseDir({ sessions: { get: () => ({ meta: { cwd: root } }) } }, 'old'),
+    (error) => error.status === 404)
   assert.throws(() => resolveBaseDir(ctx, 'missing'), (error) => error.status === 404)
   for (const value of [null, '', '   ', 7]) {
     assert.throws(() => resolveBaseDir(ctx, value, true), (error) => error.status === 400)

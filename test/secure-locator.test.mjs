@@ -425,7 +425,7 @@ test('continuations reject a removed or rebound session workspace', async () => 
   }), 404)
 })
 
-test('expired challenges and legacy protocol requests are rejected', async () => {
+test('expired challenges and unsupported protocol requests are rejected', async () => {
   let clock = 100
   const { secure, calls } = harness({ now: () => clock, ttlMs: 10 })
   const metadata = await secure({ protocolVersion: 2, phase: 'metadata', sessionId: 'session-1', file })
@@ -434,5 +434,5 @@ test('expired challenges and legacy protocol requests are rejected', async () =>
     protocolVersion: 2, phase: 'sample', sessionId: 'session-1', file, challenge: metadata.challenge,
   }), 410)
 
-  await rejectsStatus(secure({ protocolVersion: 1, phase: 'sample', file, candidates: ['D:/legacy'], digest: '0'.repeat(64) }), 426)
+  await rejectsStatus(secure({ protocolVersion: 1, phase: 'sample', file, candidates: ['D:/unsupported'], digest: '0'.repeat(64) }), 426)
 })

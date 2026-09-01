@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
 import { locate } from './locator.js'
 import { HttpError, resolveBaseDir, sessionCwd } from '../host-safety.js'
+import { platformPathKey } from '../platform/index.js'
 
 const PROTOCOL_VERSION = 2
 const CHALLENGE_TTL_MS = 2 * 60 * 1000
@@ -69,7 +70,7 @@ function sameStringArray(left, right) {
 function workspaceKey(value) {
   if (typeof value !== 'string' || value === '') return ''
   const path = resolve(value)
-  return process.platform === 'win32' || process.platform === 'darwin' ? path.toUpperCase() : path
+  return platformPathKey(path)
 }
 
 function trustedWorkspaceRoots(ctx, currentWorkspacePath, excludedPaths) {
