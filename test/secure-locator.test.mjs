@@ -395,10 +395,13 @@ test('locator error results do not consume a challenge', async () => {
 
 test('locate concurrency gate rejects excess work without consuming capacity', async () => {
   let release
+  let markStarted
   const pending = new Promise((resolve) => { release = resolve })
-  const locateFn = async () => pending
+  const started = new Promise((resolve) => { markStarted = resolve })
+  const locateFn = async () => { markStarted(); return pending }
   const { secure } = harness({ locateFn, maxConcurrentLocates: 1, maxConcurrentLocatesPerSession: 1 })
   const first = secure({ protocolVersion: 2, phase: 'metadata', sessionId: 'session-1', file })
+  await started
   await rejectsStatus(secure({ protocolVersion: 2, phase: 'metadata', sessionId: 'session-1', file }), 429)
   release({ status: 'not-found' })
   assert.equal((await first).status, 'not-found')

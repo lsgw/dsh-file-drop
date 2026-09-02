@@ -1,9 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { resolve } from 'node:path'
 import { LOCATE_PROTOCOL_VERSION as PROTOCOL_VERSION } from '../shared/contract.js'
 import { locate } from './locator.js'
 import { HttpError, resolveBaseDir, sessionCwd } from '../host/safety.js'
-import { pathKey } from '../shared/node-path.js'
+import { physicalPathKey } from '../shared/node-path.js'
 
 const CHALLENGE_TTL_MS = 2 * 60 * 1000
 const MAX_CHALLENGES = 1024
@@ -67,30 +66,32 @@ function sameStringArray(left, right) {
     && left.every((value, index) => value === right[index])
 }
 
-function workspaceKey(value) {
+async function workspaceKey(value) {
   if (typeof value !== 'string' || value === '') return ''
-  const path = resolve(value)
-  return pathKey(path)
+  return physicalPathKey(value)
 }
 
-function trustedWorkspaceRoots(ctx, currentWorkspacePath, excludedPaths) {
-  const excluded = new Set((Array.isArray(excludedPaths) ? excludedPaths : []).slice(0, 64).map(workspaceKey).filter(Boolean))
+async function trustedWorkspaceRoots(ctx, currentWorkspacePath, excludedPaths) {
+  const excluded = new Set()
+  for (const value of (Array.isArray(excludedPaths) ? excludedPaths : []).slice(0, 64)) {
+    const key = await workspaceKey(value)
+    if (key) excluded.add(key)
+  }
   const roots = []
   const seen = new Set()
-  const add = (value) => {
-    const key = workspaceKey(value)
+  const add = async (value) => {
+    const key = await workspaceKey(value)
     if (!key || seen.has(key) || excluded.has(key) || roots.length >= 64) return
     seen.add(key)
     roots.push(value)
   }
-  add(currentWorkspacePath)
+  await add(currentWorkspacePath)
   try {
     const sessions = ctx.sessions && typeof ctx.sessions.list === 'function' ? ctx.sessions.list() : []
-    for (const session of sessions) add(sessionCwd(session))
+    for (const session of sessions) await add(sessionCwd(session))
   } catch {}
   return roots
 }
-
 export function createSecureLocator(ctx, options = {}) {
   const ttlMs = options.ttlMs || CHALLENGE_TTL_MS
   const maxChallenges = options.maxChallenges || MAX_CHALLENGES
@@ -242,18 +243,22 @@ export function createSecureLocator(ctx, options = {}) {
   const secureMetadata = async (request) => {
     let currentWorkspacePath
     const hasSession = Object.hasOwn(request, 'sessionId')
-    if (hasSession) currentWorkspacePath = resolveBaseDirFn(ctx, request.sessionId, true)
+    if (hasSession) currentWorkspacePath = await resolveBaseDirFn(ctx, request.sessionId, true)
     const key = requestSessionKey(request)
     prune()
     if (activeCount(key) >= maxChallengesPerSession) {
       throw new HttpError(429, 'too many active locate challenges for this session')
     }
-    const workspacePaths = trustedWorkspaceRoots(ctx, currentWorkspacePath, request.excludedWorkspacePaths)
-    const currentKey = workspaceKey(currentWorkspacePath)
+    const workspacePaths = await trustedWorkspaceRoots(ctx, currentWorkspacePath, request.excludedWorkspacePaths)
+    const currentKey = await workspaceKey(currentWorkspacePath)
+    let currentTrusted = false
+    for (const path of workspacePaths) {
+      if (await workspaceKey(path) === currentKey) { currentTrusted = true; break }
+    }
     const trustedRequest = {
       ...request,
       workspacePaths,
-      currentWorkspacePath: workspacePaths.some((path) => workspaceKey(path) === currentKey) ? currentWorkspacePath : undefined,
+      currentWorkspacePath: currentTrusted ? currentWorkspacePath : undefined,
     }
     const result = await runLocate(request, () => locateFn(trustedRequest))
     const phase = nextPhase(result)
@@ -286,8 +291,8 @@ export function createSecureLocator(ctx, options = {}) {
     if (record.sessionId !== sessionKey) throw new HttpError(403, 'locate session mismatch')
     if (record.fileIdentity !== fileIdentity(request.file)) throw new HttpError(409, 'dropped-file metadata changed')
     if (sessionKey !== 'global') {
-      const currentWorkspacePath = resolveBaseDirFn(ctx, request.sessionId, true)
-      if (workspaceKey(currentWorkspacePath) !== record.workspaceScope) {
+      const currentWorkspacePath = await resolveBaseDirFn(ctx, request.sessionId, true)
+      if (await workspaceKey(currentWorkspacePath) !== record.workspaceScope) {
         throw new HttpError(409, 'locate session workspace changed')
       }
     }

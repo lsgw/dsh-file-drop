@@ -1,4 +1,4 @@
-const STATUS_DISMISS_MS = 3500
+const STATUS_DISMISS_MS = 500
 const statusStore = {
   value: null,
   listeners: new Set(),

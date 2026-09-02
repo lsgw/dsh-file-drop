@@ -1,6 +1,5 @@
 // dsh-file-drop / locate engine — multi-phase file/directory locator.
-import { homedir } from 'node:os'
-import { basename, join, normalize } from 'node:path'
+import { basename, dirname, join, normalize } from 'node:path'
 import { lstat, opendir } from 'node:fs/promises'
 import {
   DIRECTORY_MAX_ENTRIES,
@@ -13,7 +12,7 @@ import {
 import { nodeDirectoryContentDigest, nodeDirectoryStructureDigest } from './directory-node.js'
 import { fullFingerprint, sampleFingerprint } from './fingerprint.js'
 import { runIsolatedTask } from './isolate.js'
-import { pathKey } from '../shared/node-path.js'
+import { physicalPathKey, sameDirectoryEntry } from '../shared/node-path.js'
 import { SAMPLE_BYTES, SMALL_FILE_BYTES } from './protocol.js'
 
 const MAX_CANDIDATES = 100
@@ -23,9 +22,14 @@ const MAX_NAME_LENGTH = 1024
 const MAX_PATH_LENGTH = 32768
 const MAX_WALK_ENTRIES = 20000
 const WALK_TIMEOUT_MS = 10000
+const DIRECT_ROOT_TIMEOUT_MS = 1500
 const WALK_DEPTH = 12
 const MAX_FULL_CANDIDATES = 8
 const MAX_DIRECTORY_DIGEST_CANDIDATES = 16
+
+function compareText(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0
+}
 
 function candidatePaths(value) {
   if (!Array.isArray(value) || value.length > MAX_CANDIDATES) return undefined
@@ -144,7 +148,7 @@ async function walkByName(root, name, kind, budget, depth = WALK_DEPTH) {
         if (budget.visited > MAX_WALK_ENTRIES || Date.now() >= budget.deadline
           || found.length >= MAX_CANDIDATES) break
         const path = join(directory, entry.name)
-        if (entry.name === name && (kind === 'file' ? entry.isFile() : entry.isDirectory())) found.push(path)
+        if (await sameDirectoryEntry(directory, entry.name, name, budget.deadline) && (kind === 'file' ? entry.isFile() : entry.isDirectory())) found.push(path)
         if (entry.isDirectory() && !entry.isSymbolicLink()) await visit(path, remaining - 1)
       }
     } finally {
@@ -162,20 +166,25 @@ async function validateCandidates(item, paths, budget) {
     try {
       const info = budget ? await beforeDeadline(lstat(path), budget) : await lstat(path)
       const kindMatches = item.kind === 'file' ? info.isFile() && info.size === item.size : info.isDirectory()
-      if (kindMatches && basename(path) === item.name) candidates.push({ path: normalize(path), mtimeMs: info.mtimeMs })
+      if (kindMatches && await sameDirectoryEntry(dirname(path), basename(path), item.name, budget && budget.deadline)) candidates.push({ path: normalize(path), mtimeMs: info.mtimeMs })
     } catch (error) {
       if (error?.status === 429 || error?.status === 503) throw error
       // Candidate disappeared between lookup and validation.
     }
   }
   return candidates.sort((a, b) => item.kind === 'file'
-    ? Math.abs(a.mtimeMs - item.lastModified) - Math.abs(b.mtimeMs - item.lastModified) || a.path.localeCompare(b.path)
-    : a.path.localeCompare(b.path)).slice(0, MAX_CANDIDATES)
+    ? Math.abs(a.mtimeMs - item.lastModified) - Math.abs(b.mtimeMs - item.lastModified) || compareText(a.path, b.path)
+    : compareText(a.path, b.path)).slice(0, MAX_CANDIDATES)
 }
 
 async function directCandidates(item, roots, budget) {
-  const paths = await Promise.all(roots.map(root => directCandidate(root, item.name, item.kind, budget)))
-  return validateCandidates(item, paths.filter(path => path !== undefined), budget)
+  const paths = []
+  await Promise.all(roots.map(async (root) => {
+    const rootBudget = { deadline: Math.min(budget.deadline, Date.now() + DIRECT_ROOT_TIMEOUT_MS) }
+    const path = await directCandidate(root, item.name, item.kind, rootBudget)
+    if (path !== undefined) paths.push(path)
+  }))
+  return paths
 }
 
 async function recursiveCandidates(item, roots, budget) {
@@ -188,12 +197,20 @@ async function recursiveCandidates(item, roots, budget) {
 }
 
 async function metadataCandidates(item, request) {
-  const candidateKey = (value) => pathKey(normalize(value))
-  const excluded = new Set((Array.isArray(request.excludedCandidates) ? request.excludedCandidates : [])
+  const candidateKey = (value) => physicalPathKey(normalize(value))
+  const excluded = new Set()
+  for (const value of (Array.isArray(request.excludedCandidates) ? request.excludedCandidates : [])
     .slice(0, MAX_CANDIDATES)
-    .filter(value => typeof value === 'string' && value !== '' && value.length <= MAX_PATH_LENGTH && !value.includes('\0'))
-    .map(candidateKey))
-  const withoutExcluded = (candidates) => candidates.filter(candidate => !excluded.has(candidateKey(candidate.path)))
+    .filter(value => typeof value === 'string' && value !== '' && value.length <= MAX_PATH_LENGTH && !value.includes('\0'))) {
+    excluded.add(await candidateKey(value))
+  }
+  const withoutExcluded = async (candidates) => {
+    const kept = []
+    for (const candidate of candidates) {
+      if (!excluded.has(await candidateKey(candidate.path))) kept.push(candidate)
+    }
+    return kept
+  }
   const current = typeof request.currentWorkspacePath === 'string'
     && request.currentWorkspacePath !== ''
     && request.currentWorkspacePath.length <= MAX_PATH_LENGTH
@@ -204,16 +221,15 @@ async function metadataCandidates(item, request) {
     .filter(root => typeof root === 'string' && root !== '' && root.length <= MAX_PATH_LENGTH)
     .slice(0, MAX_WORKSPACE_ROOTS)
   const otherWorkspaces = workspaceRoots.filter(root => root !== current)
-  const commonRoots = [join(homedir(), 'Desktop'), join(homedir(), 'Documents'), join(homedir(), 'Downloads')]
-  const rootGroups = [current === undefined ? [] : [current], otherWorkspaces, commonRoots]
+  const rootGroups = [current === undefined ? [] : [current], otherWorkspaces]
   const paths = []
 
   // 先验证所有已知根，再用同一套 Node fs 扫描寻找嵌套原件。
   const directBudget = { deadline: Date.now() + WALK_TIMEOUT_MS }
   for (const roots of rootGroups) {
-    paths.push(...(await directCandidates(item, roots, directBudget)).map(candidate => candidate.path))
+    paths.push(...await directCandidates(item, roots, directBudget))
   }
-  let knownCandidates = withoutExcluded(await validateCandidates(item, paths, directBudget))
+  let knownCandidates = await withoutExcluded(await validateCandidates(item, paths, { deadline: Date.now() + WALK_TIMEOUT_MS }))
   if (knownCandidates.length > 0) return knownCandidates
 
   const recursivePaths = []
@@ -224,7 +240,7 @@ async function metadataCandidates(item, request) {
     recursivePaths.push(...(await isolatedRecursiveCandidates(item, roots, budget)).map(candidate => candidate.path))
   }
   paths.push(...recursivePaths)
-  knownCandidates = withoutExcluded(await validateCandidates(item, paths, budget))
+  knownCandidates = await withoutExcluded(await validateCandidates(item, paths, budget))
   return knownCandidates
 }
 
@@ -235,7 +251,7 @@ async function matchingFileDigest(candidates, digest, phase, file) {
     if (Date.now() >= budget.deadline) throw deadlineError()
     try {
       const info = await beforeDeadline(lstat(path), budget)
-      if (!info.isFile() || info.size !== file.size || basename(path) !== file.name) continue
+      if (!info.isFile() || info.size !== file.size || !await sameDirectoryEntry(dirname(path), basename(path), file.name, budget.deadline)) continue
       const fingerprint = phase === 'sample' ? sampleFingerprint(path, file.size) : fullFingerprint(path)
       const actual = await beforeDeadline(fingerprint, budget)
       if (actual === digest) matched.push(normalize(path))

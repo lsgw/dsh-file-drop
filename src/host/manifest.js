@@ -1,6 +1,6 @@
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { homedir } from 'node:os'
-import { pathKey } from '../shared/node-path.js'
+import { collisionKey } from '../shared/node-path.js'
 import {
   DEFAULT_UPLOAD_QUOTA_BYTES, LOCATE_MODE_ERROR_CODE, MAX_UPLOAD_QUOTA_BYTES,
   QUOTA_ERROR_CODE, QUOTA_ERROR_MESSAGE,
@@ -119,7 +119,7 @@ function truncateNamePreservingExtension(value) {
 }
 
 export function sanitizeName(value) {
-  let safe = basename(String(value || '').normalize('NFC'))
+  let safe = basename(String(value || ''))
     .replace(/[\/<>:"|?*\u0000-\u001f\u007f]/g, '_')
   if (sep === '\\') safe = safe.replace(/\\/g, '_')
   safe = safe
@@ -150,20 +150,20 @@ function entrySegments(value) {
   if (typeof value !== 'string' || value === '' || value.length > MAX_ENTRY_PATH_LENGTH || value.includes('\0')) {
     throw new HttpError(400, 'invalid directory entry path')
   }
-  const normalized = value.normalize('NFC')
-  if (normalized.startsWith('/') || /^[A-Za-z]:/.test(normalized)
-    || (sep === '\\' && normalized.includes('\\'))) {
+  const protocolPath = value
+  if (protocolPath.startsWith('/') || /^[A-Za-z]:/.test(protocolPath)
+    || (sep === '\\' && protocolPath.includes('\\'))) {
     throw new HttpError(400, 'directory entry path must be relative')
   }
-  const parts = normalized.split('/')
+  const parts = protocolPath.split('/')
   if (parts.length > MAX_DIRECTORY_DEPTH || parts.some((part) => part === '' || part === '.' || part === '..')) {
     throw new HttpError(400, 'invalid directory entry path')
   }
-  return { original: parts.map((part) => part.normalize('NFC')), safe: parts.map(sanitizeName) }
+  return { original: parts, safe: parts.map(sanitizeName) }
 }
 
 function directoryCollisionKey(parts) {
-  return pathKey(parts.join('/'))
+  return collisionKey(parts)
 }
 
 function decodeDirectoryManifest(name, entries, maxBytes) {
@@ -184,12 +184,14 @@ function decodeDirectoryManifest(name, entries, maxBytes) {
     for (let index = 0; index < path.safe.length; index += 1) {
       const safeKey = directoryCollisionKey(path.safe.slice(0, index + 1))
       const originKey = directoryCollisionKey(path.original.slice(0, index + 1))
+      const originPath = path.original.slice(0, index + 1).join('/')
       const kind = index === path.safe.length - 1 ? entry.kind : 'directory'
       const existing = nodes.get(safeKey)
-      if (existing && (existing.kind !== kind || existing.originKey !== originKey || kind === 'file')) {
+      if (existing && (existing.kind !== kind || existing.originKey !== originKey
+        || existing.originPath !== originPath || kind === 'file')) {
         throw new HttpError(409, 'directory entries collide after sanitization')
       }
-      if (!existing) nodes.set(safeKey, { kind, originKey })
+      if (!existing) nodes.set(safeKey, { kind, originKey, originPath })
       if (kind === 'directory') directories.set(safeKey, path.safe.slice(0, index + 1))
     }
     if (entry.kind === 'directory') {

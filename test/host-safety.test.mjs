@@ -131,12 +131,10 @@ test('directory manifest enforces structure limits independently from configured
   ] })
   assert.equal(nested.entryCount, 5)
   assert.equal(nested.totalBytes, 80 * 1024 * 1024)
-  if (process.platform === 'win32') {
-    assert.throws(() => decodeUploadManifest({ kind: 'directory', name: 'root', entries: [
-      { kind: 'file', path: 'Case.txt', size: 0 },
-      { kind: 'file', path: 'case.txt', size: 0 },
-    ] }), /collide/)
-  }
+  assert.throws(() => decodeUploadManifest({ kind: 'directory', name: 'root', entries: [
+    { kind: 'file', path: 'Case.txt', size: 0 },
+    { kind: 'file', path: 'case.txt', size: 0 },
+  ] }), /collide/)
   const tooDeep = Array.from({ length: 33 }, (_, index) => 'd' + index).join('/')
   assert.throws(() => decodeUploadManifest({
     kind: 'directory', name: 'root', entries: [{ kind: 'file', path: tooDeep, size: 0 }],
@@ -183,6 +181,14 @@ test('directory protocol preserves POSIX backslash names', () => {
   })
   if (sep === '\\') assert.throws(decode, /entry path/)
   else assert.deepEqual(decode().files[0].segments, [entryPath])
+})
+
+test('directory protocol preserves raw Unicode components', () => {
+  const entryPath = 'e' + String.fromCharCode(0x301) + '.txt'
+  const result = decodeUploadManifest({
+    kind: 'directory', name: 'root', entries: [{ kind: 'file', path: entryPath, size: 0 }],
+  })
+  assert.equal(result.files[0].segments[0], entryPath)
 })
 
 test('chunk writes require contiguous exact blocks and preserve retryability', async (t) => {

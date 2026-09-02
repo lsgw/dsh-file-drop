@@ -49,6 +49,26 @@ test('client source modules stay bounded and generated bundle stays singular', a
 })
 
 
+test('client core uses standard file and directory capabilities only', async () => {
+  const [dropData, view, runtime, controller] = await Promise.all([
+    source('client', 'drop-data.js'),
+    source('client', 'view.js'),
+    source('client', 'runtime.js'),
+    source('client', 'drop-controller.js'),
+  ])
+  for (const [name, text] of [['drop-data.js', dropData], ['view.js', view], ['runtime.js', runtime], ['drop-controller.js', controller]]) {
+    assert.doesNotMatch(text, /dshDesktop|fileUriToPath|extractPaths|drainShellPaths|shellPathOf|webkitGetAsEntry|insert-paths/, name)
+  }
+  assert.match(dropData, /getAsFileSystemHandle/)
+})
+
+test('client build uses a standards-based browser target', async () => {
+  const build = await readFile(join(root, 'scripts', 'build-client.mjs'), 'utf8')
+  assert.match(build, /platform: 'browser'/)
+  assert.match(build, /target: \['es2022'\]/)
+  assert.doesNotMatch(build, /chrome\d+/i)
+})
+
 test('locate core uses generic Node filesystem scanning without platform adapters', async () => {
   const files = [
     'locate/locator.js', 'locate/directory-node.js', 'locate/isolate.js',
@@ -63,7 +83,11 @@ test('locate core uses generic Node filesystem scanning without platform adapter
   const pathKey = await source('shared', 'node-path.js')
   const storage = await source('host', 'storage.js')
   assert.match(pathKey, /from 'node:path'/)
-  assert.match(pathKey, /sep/)
+  assert.match(pathKey, /realpathSync/)
+  assert.match(pathKey, /statSync/)
+  assert.match(pathKey, /physicalPathKey/)
+  assert.match(pathKey, /collisionKey/)
+  assert.match(pathKey, /sameDirectoryEntry/)
   assert.doesNotMatch(pathKey, /process\.platform/)
   assert.doesNotMatch(storage, /realpathSync\.native/)
 })

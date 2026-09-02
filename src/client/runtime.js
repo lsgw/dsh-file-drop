@@ -8,10 +8,9 @@ export {
   refreshSettings, uploadChunked, uploadFileChunks, writeSettings,
 } from './api.js'
 export {
-  abortableDelay, drainShellPaths, extractPaths, fileUriToPath, getDirectoryEntries,
-  readEntryAll, shellPathOf, shouldHandleDataTransfer,
+  abortableDelay, getDirectoryEntries,
+  readEntryAll, shouldHandleDataTransfer,
 } from './drop-data.js'
-export { insertPaths } from './editor.js'
 export { formatSize } from './format.js'
 export { processDirectoryUpload, processFilesUpload } from './upload-strategy.js'
 export { processDirectoryLocate, processFilesLocate } from './locate-strategy.js'
@@ -26,7 +25,7 @@ import {
   beginModeChange, clearUserUploadRoot, readUserUploadUsage, refreshModeForAction,
   refreshSettings, uploadChunked, uploadFileChunks, writeSettings,
 } from './api.js'
-import { fileUriToPath, readEntryAll, shouldHandleDataTransfer } from './drop-data.js'
+import { getDirectoryEntries, readEntryAll, shouldHandleDataTransfer } from './drop-data.js'
 import { chooseDropAction } from './drop-controller.js'
 import { processDirectoryUpload, processFilesUpload } from './upload-strategy.js'
 import { chooseDropOwner, retryWorkspaceContext } from './session.js'
@@ -47,7 +46,7 @@ export const clientTestApi = Object.freeze({
   readUserUploadUsage,
   clearUserUploadRoot,
   writeSettings,
-  fileUriToPath,
+  getDirectoryEntries,
   retryWorkspaceContext,
   shouldHandleDataTransfer,
 })

@@ -15,12 +15,13 @@ for (const relative of [
   'src/locate/isolate-runner.js', 'src/locate/secure-locator.js', 'src/shared/node-path.js',
 ]) await access(join(root, relative))
 
-const [host, contract, settings, safety, protocol] = await Promise.all([
+const [host, contract, settings, safety, protocol, nodePath] = await Promise.all([
   import(moduleUrl('index.js')),
   import(moduleUrl('src/shared/contract.js')),
   import(moduleUrl('src/host/settings.js')),
   import(moduleUrl('src/host/safety.js')),
   import(moduleUrl('src/locate/protocol.js')),
+  import(moduleUrl('src/shared/node-path.js')),
 ])
 assert.equal(host.name, 'dsh-file-drop')
 assert.deepEqual(host.inject, ['webServer', 'sessions'])
@@ -32,6 +33,10 @@ assert.equal(settings.MAX_UPLOAD_QUOTA_MIB, contract.MAX_UPLOAD_QUOTA_MIB)
 assert.equal(protocol.FILE_DROP_ROUTE, contract.FILE_DROP_ROUTE)
 assert.equal(typeof safety.commitUploadStage, 'function')
 assert.equal(typeof safety.decodeUploadManifest, 'function')
+assert.equal(typeof nodePath.pathKey, 'function')
+assert.equal(typeof nodePath.physicalPathKey, 'function')
+assert.equal(typeof nodePath.collisionKey, 'function')
+assert.equal(typeof nodePath.sameDirectoryEntry, 'function')
 
 let definition
 globalThis.window = { __ModuleLoader__: { load(value) { definition = value } } }

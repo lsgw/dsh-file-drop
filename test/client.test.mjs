@@ -30,41 +30,21 @@ test('multi-composer drop ownership never uses registration order as an ambiguou
 
 
 test('upload and locate mode actions are mutually exclusive', () => {
-  const shellPaths = ['C:\\source\\file.txt']
-  const extractedPaths = ['/source/file.txt']
-  assert.deepEqual(client.chooseDropAction('upload', {
-    shellPaths, extractedPaths, fileCount: 1,
-  }), { type: 'upload-files' })
-  assert.deepEqual(client.chooseDropAction('upload', {
-    shellPaths, extractedPaths, directoryCount: 1, fileCount: 1,
-  }), { type: 'upload-directories' })
-  assert.deepEqual(client.chooseDropAction('upload', {
-    shellPaths, extractedPaths,
-  }), { type: 'none' })
-  assert.deepEqual(client.chooseDropAction('locate', {
-    shellPaths, extractedPaths, directoryCount: 1, fileCount: 1,
-  }), { type: 'insert-paths', paths: shellPaths })
-  assert.deepEqual(client.chooseDropAction('locate', {
-    extractedPaths, directoryCount: 1,
-  }), { type: 'insert-paths', paths: extractedPaths })
-  assert.deepEqual(client.chooseDropAction('locate', { directoryCount: 1 }), { type: 'locate-directories' })
+  assert.deepEqual(client.chooseDropAction('upload', { fileCount: 1 }), { type: 'upload-files' })
+  assert.deepEqual(client.chooseDropAction('upload', { directoryCount: 1, fileCount: 1 }), { type: 'upload-directories' })
+  assert.deepEqual(client.chooseDropAction('locate', { directoryCount: 1, fileCount: 1 }), { type: 'locate-directories' })
   assert.deepEqual(client.chooseDropAction('locate', { fileCount: 1 }), { type: 'locate-files' })
+  assert.deepEqual(client.chooseDropAction('locate', {}), { type: 'none' })
 })
+
+
 
 test('upload always copies file content in bounded chunks without reading an original path', async (t) => {
   const originalFetch = globalThis.fetch
   const originalDocument = globalThis.document
-  const originalDesktop = window.dshDesktop
-  let shellPathReads = 0
   let draft = ''
   const requests = []
   const chunks = []
-  window.dshDesktop = {
-    getPathForFile() {
-      shellPathReads += 1
-      return 'C:\\source\\original.txt'
-    },
-  }
   globalThis.document = { querySelectorAll: () => [] }
   globalThis.fetch = async (url, options) => {
     requests.push({ url, options })
@@ -89,7 +69,6 @@ test('upload always copies file content in bounded chunks without reading an ori
   t.after(() => {
     globalThis.fetch = originalFetch
     globalThis.document = originalDocument
-    window.dshDesktop = originalDesktop
     client.statusStore.clear()
   })
 
@@ -100,7 +79,6 @@ test('upload always copies file content in bounded chunks without reading an ori
     isActive: () => true,
   })
 
-  assert.equal(shellPathReads, 0)
   assert.deepEqual(requests.map((request) => request.url), [
     '/api/dsh-file-drop/upload/init',
     '/api/dsh-file-drop/upload/chunk',
@@ -113,11 +91,7 @@ test('upload always copies file content in bounded chunks without reading an ori
   assert.doesNotMatch(draft, /source\\original[.]txt/)
 })
 
-test('file URI and retry context stay platform-neutral', () => {
-  assert.equal(client.fileUriToPath('file:///C:/Users/Test/report.txt'), 'C:\\Users\\Test\\report.txt')
-  assert.equal(client.fileUriToPath('file:///home/test/report.txt'), '/home/test/report.txt')
-  assert.equal(client.fileUriToPath('file://localhost/home/test/report.txt'), '/home/test/report.txt')
-  assert.equal(client.fileUriToPath('file://server/share/report.txt'), '//server/share/report.txt')
+test('retry context excludes the previous workspace', () => {
   assert.deepEqual(client.retryWorkspaceContext({
     workspacePaths: ['C:\\Work', 'D:\\Other'],
     sessionId: 'session-1',
@@ -389,6 +363,36 @@ test('client directory reader preserves backslashes inside POSIX names', async (
   assert.equal(entries[0].path, 'a\\b.txt')
   assert.equal(entries[0].kind, 'file')
   assert.equal(entries[0].file.name, 'a\\b.txt')
+})
+
+test('client directory reader preserves raw Unicode names', async () => {
+  const name = 'e' + String.fromCharCode(0x301) + '.txt'
+  const entries = await client.readEntryAll(directoryEntry([fileEntry(name)]), 501, { count: 0, entries: 0 })
+  assert.equal(entries[0].path, name)
+  assert.equal(entries[0].file.name, name)
+})
+
+test('standard file system handles adapt to the directory entry contract', async () => {
+  const fileHandle = {
+    kind: 'file', name: 'child.txt',
+    getFile: async () => new File(['x'], 'child.txt'),
+  }
+  const directoryHandle = {
+    kind: 'directory', name: 'root',
+    values() {
+      let sent = false
+      return {
+        next: async () => sent ? { done: true } : (sent = true, { done: false, value: fileHandle }),
+      }
+    },
+  }
+  const directories = await client.getDirectoryEntries([{
+    getAsFileSystemHandle: async () => directoryHandle,
+  }])
+  assert.equal(directories.length, 1)
+  const entries = await client.readEntryAll(directories[0], 501, { count: 0, entries: 0 })
+  assert.equal(entries[0].path, 'child.txt')
+  assert.equal(entries[0].file.name, 'child.txt')
 })
 
 test('client directory upload sends a content-free manifest and streams file bytes', async (t) => {

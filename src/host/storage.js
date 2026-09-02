@@ -1,9 +1,8 @@
-import { realpathSync } from 'node:fs'
 import { lstat, mkdir, open, opendir, realpath, rename, rm, rmdir } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { runIsolatedTask } from '../locate/isolate.js'
-import { pathKey } from '../shared/node-path.js'
+import { pathKey, physicalPathKeySync } from '../shared/node-path.js'
 import {
   DEFAULT_UPLOAD_QUOTA_BYTES,
   DEFAULT_UPLOAD_QUOTA_ENTRIES,
@@ -29,10 +28,7 @@ function setCleanupState(key, state) {
 }
 
 function cleanupStateKey(baseDir) {
-  let path
-  try { path = realpathSync(baseDir) } catch { path = resolve(baseDir) }
-  path = resolve(path)
-  return pathKey(path)
+  return physicalPathKeySync(baseDir)
 }
 
 export function dropCleanupStatus(baseDir) {
@@ -91,7 +87,7 @@ async function ensurePlainDirectory(path) {
     if (info.isSymbolicLink() || !info.isDirectory()) throw new HttpError(409, 'unsafe directory path')
     return
   }
-  try { await mkdir(path) } catch (error) {
+  try { await mkdir(path, { mode: 0o700 }) } catch (error) {
     if (!error || error.code !== 'EEXIST') throw error
   }
   await assertPlainDirectory(path)
@@ -147,7 +143,7 @@ async function cleanupQuarantines(baseDir) {
 }
 
 export async function ensureDropRoot(baseDir) {
-  await mkdir(baseDir, { recursive: true })
+  await mkdir(baseDir, { recursive: true, mode: 0o700 })
   const root = join(baseDir, '.dsh-drops')
   await ensurePlainDirectory(root)
   const baseReal = await realpath(baseDir)
@@ -234,7 +230,7 @@ export async function cleanupOrphanUploadStages(baseDir, activeNames = new Set()
 }
 
 async function createPreallocatedFile(path, size) {
-  const handle = await open(path, 'wx')
+  const handle = await open(path, 'wx', 0o600)
   try { await handle.truncate(size) } finally { await handle.close() }
 }
 
@@ -271,7 +267,7 @@ export async function createUploadStage(baseDir, manifest, uploadId) {
       await createPreallocatedFile(path, manifest.totalBytes)
       files = [{ path, size: manifest.totalBytes, written: 0 }]
     } else {
-      await mkdir(path)
+      await mkdir(path, { mode: 0o700 })
       files = await createManifestStageTree(path, manifest)
     }
     return {
@@ -485,7 +481,7 @@ export async function clearDropRoot(baseDir, options = {}) {
   const quarantine = join(baseDir, '.dsh-drops.deleting-' + randomUUID())
   await rename(root, quarantine)
   try {
-    await mkdir(root)
+    await mkdir(root, { mode: 0o700 })
   } catch (error) {
     try { await rename(quarantine, root) } catch (restoreError) {
       throw new AggregateError([error, restoreError], 'clear and rollback failed')

@@ -2,11 +2,11 @@ import {
   MAX_ROOT_DIRECTORIES, MAX_TOP_LEVEL_FILES, MAX_UPLOAD_QUOTA_ENTRIES,
   MAX_UPLOAD_QUOTA_MIB, MIB_BYTES, MODE_READ_ERROR_MESSAGE, QUOTA_ERROR_MESSAGE,
   abortableDelay, adoptSettings, beginModeChange, claimedDropEvents, clearUserUploadRoot, currentMode,
-  currentSessionMatches, currentSessionWorkspacePath, currentSettings, drainShellPaths,
-  dropOwners, extractPaths, formatSize, getDirectoryEntries, insertPaths, modeRevision, normalizeSessionId,
+  currentSessionMatches, currentSessionWorkspacePath, currentSettings,
+  dropOwners, formatSize, getDirectoryEntries, modeRevision, normalizeSessionId,
   operationController, processDirectoryLocate, processDirectoryUpload, processFilesLocate,
   processFilesUpload, readUserUploadUsage, refreshModeForAction, refreshSettings,
-  selectDropOwner, shellPathOf, shouldHandleDataTransfer, statusStore, writeSettings,
+  selectDropOwner, shouldHandleDataTransfer, statusStore, writeSettings,
   chooseDropAction,
 } from './runtime.js'
 
@@ -92,17 +92,7 @@ export function createView(React) {
               statusStore.show('✗ 一次最多处理 ' + MAX_TOP_LEVEL_FILES + ' 个文件')
               return
             }
-            const directPaths = []
-            const unresolved = []
-            for (const file of files) {
-              const path = shellPathOf(file)
-              if (path) directPaths.push(path)
-              else unresolved.push(file)
-            }
-            if (!snapshot.isActive()) return
-            if (directPaths.length > 0) insertPaths(snapshot.inputActions, snapshot.getDraft(), directPaths, snapshot.isActive, snapshot.ownerElement)
-            if (unresolved.length > 0) await processFilesLocate(unresolved, snapshot)
-            else statusStore.show('✓ 已获取 ' + directPaths.length + ' 个文件的原始路径')
+            await processFilesLocate(files, snapshot)
           } else await processFilesUpload(files, snapshot)
         } finally {
           handle.release()
@@ -221,7 +211,7 @@ export function createView(React) {
     React.useEffect(() => {
       // 全部挂在 window 捕获阶段：事件流的第一个节点，先于 DSH 自带的
       // document 级原生附件处理（InputBar intakeImages / DropOverlay）。
-      const hasFiles = (e) => shouldHandleDataTransfer(e.dataTransfer, currentMode)
+      const hasFiles = (e) => shouldHandleDataTransfer(e.dataTransfer)
       const claim = (e) => {
         if (selectDropOwner(e, props.sessions) !== ownerRecordRef.current) return false
         if (claimedDropEvents.has(e)) return false
@@ -255,19 +245,12 @@ export function createView(React) {
         if (depthRef.current <= 0) { depthRef.current = 0; setDrag(false) }
       }
       const onDrop = (e) => {
-        const carriesFiles = e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files')
-        const fileDrop = hasFiles(e)
-        const pathOnly = fileDrop || carriesFiles ? undefined : extractPaths(e)
-        if (!fileDrop && (!pathOnly || pathOnly.length === 0)) {
-          if (carriesFiles) { depthRef.current = 0; setDrag(false) }
-          return
-        }
-        if (!claim(e)) return
+        if (!hasFiles(e) || !claim(e)) return
         e.preventDefault()
         e.stopPropagation()
         depthRef.current = 0
         setDrag(false)
-        void handleDrop(e, pathOnly)
+        void handleDrop(e)
       }
       window.addEventListener('dragenter', onDragEnter, true)
       window.addEventListener('dragover', onDragOver, true)
@@ -320,16 +303,21 @@ export function createView(React) {
       }
     }
 
-    async function handleDrop(e, extractedPaths) {
+    async function handleDrop(e) {
       if (busyRef.current) return
+      busyRef.current = true
       const dataTransfer = e.dataTransfer
       const files = Array.from((dataTransfer && dataTransfer.files) || [])
-      const directories = getDirectoryEntries(dataTransfer && dataTransfer.items)
-      const shellPaths = drainShellPaths()
-      const suppliedPaths = extractedPaths || extractPaths(e)
       const started = { ...optsRef.current }
       const modeStatus = statusStore.begin('正在确认拖拽模式…')
-      busyRef.current = true
+      let directories
+      try {
+        directories = await getDirectoryEntries(dataTransfer && dataTransfer.items)
+      } catch {
+        busyRef.current = false
+        statusStore.finish(modeStatus, '✗ 未获取到可处理的文件或目录')
+        return
+      }
       let mode
       try { mode = await refreshModeForAction() } catch {
         busyRef.current = false
@@ -345,21 +333,9 @@ export function createView(React) {
       }
       busyRef.current = false
       const action = chooseDropAction(mode, {
-        shellPaths,
-        extractedPaths: suppliedPaths,
         directoryCount: directories.length,
         fileCount: files.length,
       })
-
-      if (action.type === 'insert-paths') {
-        if (action.paths.length > MAX_TOP_LEVEL_FILES) {
-          statusStore.show('✗ 一次最多处理 ' + MAX_TOP_LEVEL_FILES + ' 个路径')
-          return
-        }
-        insertPaths(optsRef.current.inputActions, optsRef.current.draft, action.paths, undefined, optsRef.current.ownerElement)
-        statusStore.show('✓ 已定位 ' + action.paths.length + ' 个原始路径')
-        return
-      }
 
       if (action.type.endsWith('-directories')) {
         if (directories.length > MAX_ROOT_DIRECTORIES) {
@@ -385,10 +361,7 @@ export function createView(React) {
         return
       }
 
-      const pathOnly = shellPaths.length > 0 || suppliedPaths.length > 0
-      statusStore.show(mode === 'upload' && pathOnly
-        ? '✗ 上传模式需要可读取的文件或目录内容'
-        : '✗ 未获取到可处理的文件或目录')
+      statusStore.show('✗ 未获取到可处理的文件或目录')
     }
 
     return React.createElement(React.Fragment, null,

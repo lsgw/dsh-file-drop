@@ -10,5 +10,5 @@ await build({
   outfile: 'client.js',
   platform: 'browser',
   sourcemap: false,
-  target: ['chrome120'],
+  target: ['es2022'],
 })

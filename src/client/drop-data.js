@@ -1,70 +1,7 @@
-import { MAX_DIRECTORY_ENTRIES, MAX_ROOT_DIRECTORIES } from '../shared/contract.js'
+import { MAX_ROOT_DIRECTORIES } from '../shared/contract.js'
 import { throwIfAborted } from './api.js'
 
-function drainShellPaths() {
-  try {
-    if (typeof window === 'undefined' || !window.dshDesktop) return []
-    if (typeof window.dshDesktop.drainDroppedPaths === 'function') {
-      const p = window.dshDesktop.drainDroppedPaths()
-      return Array.isArray(p) ? p : []
-    }
-  } catch { /* 忽略 */ }
-  return []
-}
-
-// 按钮/兜底场景：直接映射单个 File（preload 暴露的备用 API）
-function shellPathOf(file) {
-  try {
-    if (typeof window === 'undefined' || !window.dshDesktop) return null
-    if (typeof window.dshDesktop.getPathForFile === 'function') {
-      const p = window.dshDesktop.getPathForFile(file)
-      return (typeof p === 'string' && p.length > 0) ? p : null
-    }
-  } catch { /* 忽略 */ }
-  return null
-}
-
-function fileUriToPath(value) {
-  try {
-    const url = new URL(value)
-    if (url.protocol !== 'file:') return null
-    const host = decodeURIComponent(url.hostname)
-    let path = decodeURIComponent(url.pathname)
-    const driveUri = /^\/[A-Za-z]:\//.test(path)
-    if (driveUri) path = path.slice(1).replaceAll('/', '\\')
-    if (host && host.toLowerCase() !== 'localhost') path = '//' + host + path
-    return path || null
-  } catch { return null }
-}
-
-// 拖拽自带路径（Obsidian / 文件管理器拖拽常带 uri-list）
-function extractPaths(e) {
-  const paths = []
-  try {
-    const uris = (e.dataTransfer.getData('text/uri-list') || '').split('\n')
-    for (const line of uris) {
-      const t = line.trim()
-      if (!t || t.startsWith('#')) continue
-      if (/^file:\/\//i.test(t)) {
-        const path = fileUriToPath(t)
-        if (path) paths.push(path)
-      } else if (t.startsWith('/')) {
-        paths.push(t)
-      }
-    }
-  } catch { /* 某些浏览器/事件阶段读不了，忽略 */ }
-  if (paths.length === 0) {
-    try {
-      const plain = (e.dataTransfer.getData('text/plain') || '').trim()
-      if (plain && (plain.startsWith('/') || /^\\\\[^\\]/.test(plain) || /^[A-Za-z]:[\\/]/.test(plain)) && !plain.includes('\n')) {
-        paths.push(plain)
-      }
-    } catch { /* 忽略 */ }
-  }
-  return [...new Set(paths)]
-}
-
-// ---- 目录遍历（webkitGetAsEntry，upload 与 locate 共用） ----
+// ---- 目录遍历（标准 File System Handle） ----
 
 function abortableCallback(signal, start) {
   return new Promise((resolve, reject) => {
@@ -138,12 +75,52 @@ function shouldHandleDataTransfer(dataTransfer) {
   return Boolean(dataTransfer && Array.from(dataTransfer.types || []).includes('Files'))
 }
 
-function getDirectoryEntries(items) {
+function fileSystemHandleEntry(handle) {
+  if (!handle || typeof handle !== 'object' || typeof handle.name !== 'string') return undefined
+  if (handle.kind === 'file' && typeof handle.getFile === 'function') {
+    return {
+      name: handle.name,
+      isFile: true,
+      isDirectory: false,
+      file(resolve, reject) { Promise.resolve(handle.getFile()).then(resolve, reject) },
+    }
+  }
+  if (handle.kind !== 'directory' || typeof handle.values !== 'function') return undefined
+  let iterator
+  return {
+    name: handle.name,
+    isFile: false,
+    isDirectory: true,
+    createReader() {
+      iterator ||= handle.values()
+      return {
+        readEntries(resolve, reject) {
+          Promise.resolve().then(async () => {
+            const entries = []
+            while (entries.length < 100) {
+              const next = await iterator.next()
+              if (next.done) break
+              const entry = fileSystemHandleEntry(next.value)
+              if (entry) entries.push(entry)
+            }
+            resolve(entries)
+          }).catch(reject)
+        },
+      }
+    },
+  }
+}
+
+async function getDirectoryEntries(items) {
   const dirs = []
   if (!items) return dirs
   for (const item of items) {
     try {
-      const entry = item.webkitGetAsEntry && item.webkitGetAsEntry()
+      let entry
+      if (typeof item.getAsFileSystemHandle === 'function') {
+        try { entry = fileSystemHandleEntry(await item.getAsFileSystemHandle()) } catch { /* 当前浏览器不支持 */ }
+      }
+
       if (entry && entry.isDirectory) {
         dirs.push(entry)
         if (dirs.length > MAX_ROOT_DIRECTORIES) break
@@ -155,6 +132,5 @@ function getDirectoryEntries(items) {
 
 
 export {
-  abortableCallback, abortableDelay, drainShellPaths, extractPaths, fileUriToPath,
-  getDirectoryEntries, readEntryAll, shellPathOf, shouldHandleDataTransfer,
+  abortableCallback, abortableDelay, getDirectoryEntries, readEntryAll, shouldHandleDataTransfer,
 }

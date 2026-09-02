@@ -80,8 +80,8 @@ export function createSettingsStore(filePath) {
   }
   const write = (value) => {
     const settings = validateFileDropSettings(value)
-    mkdirSync(dirname(filePath), { recursive: true })
-    writeFileSync(filePath, JSON.stringify(settings), 'utf8')
+    mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 })
+    writeFileSync(filePath, JSON.stringify(settings), { encoding: 'utf8', mode: 0o600 })
     return settings
   }
   return Object.freeze({

@@ -8,6 +8,10 @@ import { insertPaths, summarizeItems } from './editor.js'
 import { retryWorkspaceContext, workspaceContext } from './session.js'
 import { statusStore } from './status.js'
 
+function compareText(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0
+}
+
 function droppedFileMeta(file) {
   return { kind: 'file', name: file.name, size: file.size, lastModified: file.lastModified }
 }
@@ -79,7 +83,7 @@ async function readDirectoryStructure(root, signal) {
     throwIfAborted(signal)
     if (depth >= LOCATE_MAX_DEPTH) { truncated = true; return }
     const children = await readEntryChildren(directory, signal)
-    children.sort((a, b) => a.name.normalize('NFC').localeCompare(b.name.normalize('NFC')))
+    children.sort((a, b) => compareText(a.name, b.name))
     for (const child of children) {
       throwIfAborted(signal)
       if (entries.length >= LOCATE_MAX_ENTRIES) { truncated = true; return }
@@ -102,7 +106,13 @@ async function findEntryByPath(root, relativePath, signal) {
   for (const part of relativePath.split('/')) {
     throwIfAborted(signal)
     if (!current || !current.isDirectory) return undefined
-    current = (await readEntryChildren(current, signal)).find((entry) => entry.name.normalize('NFC') === part.normalize('NFC'))
+    const children = await readEntryChildren(current, signal)
+    current = children.find((entry) => entry.name === part)
+    if (current === undefined) {
+      const normalizedPart = part.normalize('NFC')
+      const equivalent = children.filter((entry) => entry.name.normalize('NFC') === normalizedPart)
+      current = equivalent.length === 1 ? equivalent[0] : undefined
+    }
     if (current === undefined) return undefined
   }
   return current

@@ -47,36 +47,23 @@ test('status hook reads the store snapshot after every notification', () => {
   statusStore.clear()
 })
 
-test('paperclip locate inserts an Electron direct path without a global binding', async () => {
-  const globals = Object.fromEntries(['window', 'document', 'fetch'].map((name) => [name, [
-    Object.hasOwn(globalThis, name), globalThis[name],
-  ]]))
-  let draft
+test('terminal status dismisses after half a second', () => {
+  const oldSetTimeout = globalThis.setTimeout
+  const oldClearTimeout = globalThis.clearTimeout
+  let timer
+  globalThis.setTimeout = (callback, delay) => { timer = { callback, delay }; return 1 }
+  globalThis.clearTimeout = () => {}
   try {
-    api.adoptSettings(locateSettings)
-    globalThis.window = { dshDesktop: { getPathForFile: () => 'C:\\original\\report.txt' } }
-    globalThis.document = { activeElement: null, querySelectorAll: () => [] }
-    globalThis.fetch = async () => ({ ok: true, json: async () => locateSettings })
-    const mock = reactMock()
-    const tree = createView(mock.React).PaperclipButton({
-      sessionId: 'session-a',
-      input: { draft: 'prefix' },
-      inputActions: { setDraft(value) { draft = value } },
-      sessions: { list: {
-        getSnapshot: () => ({ current: 'session-a', byId: { 'session-a': { cwd: 'C:\\work' } } }),
-        subscribe: () => () => {},
-      } },
-    })
-    const owner = tree.children[0].props.ref
-    owner.current = { closest: () => ({ querySelectorAll: () => [] }) }
-    tree.children[1].props.onChange({ target: { files: [{ name: 'report.txt', size: 1 }], value: 'selected' } })
-    for (let index = 0; index < 4 && draft === undefined; index += 1) {
-      await new Promise((resolve) => setImmediate(resolve))
-    }
-    assert.equal(draft, 'prefix ' + tick + 'C:\\original\\report.txt' + tick)
-  } finally {
     statusStore.clear()
-    for (const [name, [existed, value]] of Object.entries(globals)) restoreGlobal(name, existed, value)
+    statusStore.show('✓ 完成')
+    assert.equal(timer.delay, 500)
+    assert.equal(statusStore.value, '✓ 完成')
+    timer.callback()
+    assert.equal(statusStore.value, null)
+  } finally {
+    globalThis.setTimeout = oldSetTimeout
+    globalThis.clearTimeout = oldClearTimeout
+    statusStore.clear()
   }
 })
 
