@@ -1,15 +1,17 @@
 // dsh-file-drop / locate engine — directory structure digest & content sampling.
 import { createHash } from 'node:crypto'
+import { sep } from 'node:path'
 
 export const DIRECTORY_MAX_ENTRIES = 10000
 export const DIRECTORY_MAX_DEPTH = 32
 export const DIRECTORY_SAMPLE_FILES = 24
 
 export function normalizedDirectoryPath(path) {
-  const normalized = String(path).normalize('NFC').replaceAll('\\', '/')
+  const normalized = String(path).normalize('NFC')
   const parts = normalized.split('/')
   if (normalized.startsWith('/') || parts.length > DIRECTORY_MAX_DEPTH
-    || parts.some(part => part === '' || part === '.' || part === '..')) {
+    || parts.some(part => part === '' || part === '.' || part === '..'
+      || (sep === '\\' && part.includes('\\')))) {
     throw new TypeError('invalid directory-relative path')
   }
   return normalized

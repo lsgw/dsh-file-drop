@@ -4,7 +4,7 @@ import { Readable } from 'node:stream'
 import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { randomUUID } from 'node:crypto'
-import { join } from 'node:path'
+import { join, sep } from 'node:path'
 
 import {
   HttpError,
@@ -168,12 +168,21 @@ test('stale clear quarantines remain visible to size and cumulative quota', asyn
   assert.equal((await measureDropRoot(base)).size, 0)
 })
 
-test('name sanitization handles Windows-invalid and reserved names', () => {
+test('name sanitization handles portable invalid and reserved names', () => {
   assert.equal(sanitizeName('a<b>.txt'), 'a_b_.txt')
   assert.equal(sanitizeName('CON'), '_CON')
   assert.equal(sanitizeName('../'), 'file.bin')
   assert.equal(sanitizeName('a'.repeat(178) + '😀').endsWith('😀'), true)
   assert.equal(sanitizeName('😀'.repeat(110) + '.txt').endsWith('.txt'), true)
+})
+
+test('directory protocol preserves POSIX backslash names', () => {
+  const entryPath = 'a\\b.txt'
+  const decode = () => decodeUploadManifest({
+    kind: 'directory', name: 'root', entries: [{ kind: 'file', path: entryPath, size: 0 }],
+  })
+  if (sep === '\\') assert.throws(decode, /entry path/)
+  else assert.deepEqual(decode().files[0].segments, [entryPath])
 })
 
 test('chunk writes require contiguous exact blocks and preserve retryability', async (t) => {

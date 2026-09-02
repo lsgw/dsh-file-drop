@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 import { test } from 'node:test'
 import { mkdtemp, mkdir, open, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -62,22 +63,21 @@ test('isolated filesystem task concurrency is capped and fully released', async 
 
 
 
-test('unconfirmed isolated worker termination retains its slot until close', async (t) => {
-  const root = await fixture(t, 'isolated-kill-failure')
-  const held = join(root, 'held')
-  await mkdir(held)
-  const pending = runIsolatedTask('hold-directory', { path: held }, {
-    timeoutMs: 30,
-    closeWatchdogMs: 30,
-    killProcess: (child) => {
-      setTimeout(() => child.kill('SIGKILL'), 120)
-      return false
-    },
+test('unconfirmed isolated worker termination retains its slot until close', async () => {
+  const child = new EventEmitter()
+  child.stdout = new EventEmitter()
+  child.stdin = new EventEmitter()
+  child.stdin.end = () => {}
+  const pending = runIsolatedTask('hold-directory', {}, {
+    timeoutMs: 5,
+    closeWatchdogMs: 15,
+    spawnProcess: () => child,
+    killProcess: () => false,
   })
   await assert.rejects(pending, error => error && error.status === 503)
   assert.equal(activeIsolatedTasks(), 1)
-  await waitFor(() => activeIsolatedTasks() === 0)
-  await rm(held, { recursive: true })
+  child.emit('close', 1)
+  assert.equal(activeIsolatedTasks(), 0)
 })
 
 test('sample ranges cover small and large file boundaries', () => {

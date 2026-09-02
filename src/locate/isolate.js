@@ -78,7 +78,8 @@ export async function runIsolatedTask(task, payload, options = {}) {
     }
 
     try {
-      child = spawn(process.execPath, [RUNNER_PATH], {
+      const spawnProcess = typeof options.spawnProcess === 'function' ? options.spawnProcess : spawn
+      child = spawnProcess(process.execPath, [RUNNER_PATH], {
         cwd: dirname(RUNNER_PATH),
         stdio: ['pipe', 'pipe', 'ignore'],
       })

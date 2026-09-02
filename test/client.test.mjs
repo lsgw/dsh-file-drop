@@ -383,6 +383,14 @@ test('client directory reader keeps nested empty directories', async () => {
   assert.deepEqual(entries, [{ path: 'empty', kind: 'directory' }])
 })
 
+test('client directory reader preserves backslashes inside POSIX names', async () => {
+  const root = directoryEntry([fileEntry('a\\b.txt')])
+  const entries = await client.readEntryAll(root, 501, { count: 0, entries: 0 })
+  assert.equal(entries[0].path, 'a\\b.txt')
+  assert.equal(entries[0].kind, 'file')
+  assert.equal(entries[0].file.name, 'a\\b.txt')
+})
+
 test('client directory upload sends a content-free manifest and streams file bytes', async (t) => {
   const originalFetch = globalThis.fetch
   const originalDocument = globalThis.document

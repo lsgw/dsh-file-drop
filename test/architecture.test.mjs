@@ -61,7 +61,11 @@ test('locate core uses generic Node filesystem scanning without platform adapter
     assert.doesNotMatch(text, /indexedSearch|broadSearchRoots|PowerShell|powershell\.exe|plocate|mdfind|Everything|SystemRoot|WINDIR/, name)
   }
   const pathKey = await source('shared', 'node-path.js')
+  const storage = await source('host', 'storage.js')
   assert.match(pathKey, /from 'node:path'/)
+  assert.match(pathKey, /sep/)
+  assert.doesNotMatch(pathKey, /process\.platform/)
+  assert.doesNotMatch(storage, /realpathSync\.native/)
 })
 
 test('Host keeps a thin public entry, HTTP shell, and split safety layers', async () => {

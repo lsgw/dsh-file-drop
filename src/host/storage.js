@@ -30,7 +30,7 @@ function setCleanupState(key, state) {
 
 function cleanupStateKey(baseDir) {
   let path
-  try { path = realpathSync.native(baseDir) } catch { path = resolve(baseDir) }
+  try { path = realpathSync(baseDir) } catch { path = resolve(baseDir) }
   path = resolve(path)
   return pathKey(path)
 }

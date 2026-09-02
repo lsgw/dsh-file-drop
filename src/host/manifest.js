@@ -120,7 +120,9 @@ function truncateNamePreservingExtension(value) {
 
 export function sanitizeName(value) {
   let safe = basename(String(value || '').normalize('NFC'))
-    .replace(/[\\/<>:"|?*\u0000-\u001f\u007f]/g, '_')
+    .replace(/[\/<>:"|?*\u0000-\u001f\u007f]/g, '_')
+  if (sep === '\\') safe = safe.replace(/\\/g, '_')
+  safe = safe
     .replace(/^\.+/, '')
     .replace(/[. ]+$/, '')
     .trim()
@@ -148,8 +150,9 @@ function entrySegments(value) {
   if (typeof value !== 'string' || value === '' || value.length > MAX_ENTRY_PATH_LENGTH || value.includes('\0')) {
     throw new HttpError(400, 'invalid directory entry path')
   }
-  const normalized = value.replace(/\\/g, '/')
-  if (normalized.startsWith('/') || /^[A-Za-z]:/.test(normalized)) {
+  const normalized = value.normalize('NFC')
+  if (normalized.startsWith('/') || /^[A-Za-z]:/.test(normalized)
+    || (sep === '\\' && normalized.includes('\\'))) {
     throw new HttpError(400, 'directory entry path must be relative')
   }
   const parts = normalized.split('/')
