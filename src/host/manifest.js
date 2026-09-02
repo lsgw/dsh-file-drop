@@ -1,6 +1,6 @@
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { homedir } from 'node:os'
-import { platformPathKey } from '../platform/index.js'
+import { pathKey } from '../shared/node-path.js'
 import {
   DEFAULT_UPLOAD_QUOTA_BYTES, LOCATE_MODE_ERROR_CODE, MAX_UPLOAD_QUOTA_BYTES,
   QUOTA_ERROR_CODE, QUOTA_ERROR_MESSAGE,
@@ -160,7 +160,7 @@ function entrySegments(value) {
 }
 
 function directoryCollisionKey(parts) {
-  return platformPathKey(parts.join('/'))
+  return pathKey(parts.join('/'))
 }
 
 function decodeDirectoryManifest(name, entries, maxBytes) {

@@ -3,7 +3,7 @@ import { lstat, mkdir, open, opendir, realpath, rename, rm, rmdir } from 'node:f
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { runIsolatedTask } from '../locate/isolate.js'
-import { platformPathKey } from '../platform/index.js'
+import { pathKey } from '../shared/node-path.js'
 import {
   DEFAULT_UPLOAD_QUOTA_BYTES,
   DEFAULT_UPLOAD_QUOTA_ENTRIES,
@@ -32,7 +32,7 @@ function cleanupStateKey(baseDir) {
   let path
   try { path = realpathSync.native(baseDir) } catch { path = resolve(baseDir) }
   path = resolve(path)
-  return platformPathKey(path)
+  return pathKey(path)
 }
 
 export function dropCleanupStatus(baseDir) {
@@ -153,7 +153,7 @@ export async function ensureDropRoot(baseDir) {
   const baseReal = await realpath(baseDir)
   const rootReal = await realpath(root)
   const expected = join(baseReal, '.dsh-drops')
-  if (platformPathKey(rootReal) !== platformPathKey(expected)) throw new HttpError(409, 'drop root escapes its workspace')
+  if (pathKey(rootReal) !== pathKey(expected)) throw new HttpError(409, 'drop root escapes its workspace')
   return root
 }
 
@@ -202,7 +202,7 @@ export async function ensureUploadStagingRoot(baseDir) {
   await ensurePlainDirectory(stagingRoot)
   const dropReal = await realpath(dropRoot)
   const stagingReal = await realpath(stagingRoot)
-  if (platformPathKey(stagingReal) !== platformPathKey(join(dropReal, UPLOAD_STAGING_DIRECTORY))) {
+  if (pathKey(stagingReal) !== pathKey(join(dropReal, UPLOAD_STAGING_DIRECTORY))) {
     throw new HttpError(409, 'upload staging root escapes its workspace')
   }
   return { dropRoot, stagingRoot }

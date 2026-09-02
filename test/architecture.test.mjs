@@ -49,6 +49,21 @@ test('client source modules stay bounded and generated bundle stays singular', a
 })
 
 
+test('locate core uses generic Node filesystem scanning without platform adapters', async () => {
+  const files = [
+    'locate/locator.js', 'locate/directory-node.js', 'locate/isolate.js',
+    'locate/isolate-runner.js', 'locate/secure-locator.js',
+    'host/index.js', 'host/manifest.js', 'host/storage.js',
+  ]
+  for (const name of files) {
+    const text = await source(...name.split('/'))
+    assert.doesNotMatch(text, /platform/, name)
+    assert.doesNotMatch(text, /indexedSearch|broadSearchRoots|PowerShell|powershell\.exe|plocate|mdfind|Everything|SystemRoot|WINDIR/, name)
+  }
+  const pathKey = await source('shared', 'node-path.js')
+  assert.match(pathKey, /from 'node:path'/)
+})
+
 test('Host keeps a thin public entry, HTTP shell, and split safety layers', async () => {
   const [entry, host, http, safety, manifest, storage, settings, upload, protocol] = await Promise.all([
     readFile(join(root, 'index.js'), 'utf8'),
@@ -81,7 +96,7 @@ test('Host keeps a thin public entry, HTTP shell, and split safety layers', asyn
 test('npm package contains only runtime, source, metadata, and documentation', async () => {
   const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
   assert.deepEqual(pkg.files, [
-    'index.js', 'client.js', 'src/shared', 'src/host', 'src/locate', 'src/platform',
+    'index.js', 'client.js', 'src/shared', 'src/host', 'src/locate',
     'cordis.patch.yml', 'dsh.plugin.json', 'README.md', 'LICENSE',
   ])
   assert.equal(pkg.scripts.build, 'node scripts/build-client.mjs')

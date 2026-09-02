@@ -13,7 +13,7 @@ import {
 import { nodeDirectoryContentDigest, nodeDirectoryStructureDigest } from './directory-node.js'
 import { fullFingerprint, sampleFingerprint } from './fingerprint.js'
 import { runIsolatedTask } from './isolate.js'
-import { broadSearchRoots, indexedSearch, platformPathKey } from '../platform/index.js'
+import { pathKey } from '../shared/node-path.js'
 import { SAMPLE_BYTES, SMALL_FILE_BYTES } from './protocol.js'
 
 const MAX_CANDIDATES = 100
@@ -23,7 +23,6 @@ const MAX_NAME_LENGTH = 1024
 const MAX_PATH_LENGTH = 32768
 const MAX_WALK_ENTRIES = 20000
 const WALK_TIMEOUT_MS = 10000
-const COMMAND_PHASE_TIMEOUT_MS = 3000
 const WALK_DEPTH = 12
 const MAX_FULL_CANDIDATES = 8
 const MAX_DIRECTORY_DIGEST_CANDIDATES = 16
@@ -189,10 +188,7 @@ async function recursiveCandidates(item, roots, budget) {
 }
 
 async function metadataCandidates(item, request) {
-  const candidateKey = (value) => {
-    const path = normalize(value)
-    return platformPathKey(path)
-  }
+  const candidateKey = (value) => pathKey(normalize(value))
   const excluded = new Set((Array.isArray(request.excludedCandidates) ? request.excludedCandidates : [])
     .slice(0, MAX_CANDIDATES)
     .filter(value => typeof value === 'string' && value !== '' && value.length <= MAX_PATH_LENGTH && !value.includes('\0'))
@@ -211,22 +207,15 @@ async function metadataCandidates(item, request) {
   const commonRoots = [join(homedir(), 'Desktop'), join(homedir(), 'Documents'), join(homedir(), 'Downloads')]
   const rootGroups = [current === undefined ? [] : [current], otherWorkspaces, commonRoots]
   const paths = []
-  const directBudget = { deadline: Date.now() + COMMAND_PHASE_TIMEOUT_MS }
 
-  // 不在第一个同名候选处提前返回，否则错误副本会遮蔽其他工作区中的原文件。
+  // 先验证所有已知根，再用同一套 Node fs 扫描寻找嵌套原件。
+  const directBudget = { deadline: Date.now() + WALK_TIMEOUT_MS }
   for (const roots of rootGroups) {
     paths.push(...(await directCandidates(item, roots, directBudget)).map(candidate => candidate.path))
   }
-  let validationBudget = { deadline: Date.now() + WALK_TIMEOUT_MS }
-  let knownCandidates = withoutExcluded(await validateCandidates(item, paths, validationBudget))
+  let knownCandidates = withoutExcluded(await validateCandidates(item, paths, directBudget))
   if (knownCandidates.length > 0) return knownCandidates
 
-  paths.push(...await indexedSearch(item.name, item.kind))
-  validationBudget = { deadline: Date.now() + WALK_TIMEOUT_MS }
-  knownCandidates = withoutExcluded(await validateCandidates(item, paths, validationBudget))
-  if (knownCandidates.length > 0) return knownCandidates
-
-  // 内容校验失败后的第二轮会排除旧候选，并在同一全局预算内继续递归搜索。
   const recursivePaths = []
   const budget = { visited: 0, deadline: Date.now() + WALK_TIMEOUT_MS }
   for (const roots of rootGroups) {
@@ -236,8 +225,7 @@ async function metadataCandidates(item, request) {
   }
   paths.push(...recursivePaths)
   knownCandidates = withoutExcluded(await validateCandidates(item, paths, budget))
-  if (knownCandidates.length > 0) return knownCandidates
-  return withoutExcluded(await isolatedRecursiveCandidates(item, await broadSearchRoots(), budget))
+  return knownCandidates
 }
 
 async function matchingFileDigest(candidates, digest, phase, file) {

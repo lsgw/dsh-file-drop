@@ -28,13 +28,13 @@ DeepSeek Harness Web 持久插件：把文件或目录拖入会话，按模式�
 
 - protocol v2 的 metadata 阶段签发 challenge；后续阶段绑定 phase、会话、活动工作区、文件身份、候选和目录采样集合。
 - challenge 支持同请求并发复用和 30 秒幂等回放；数量、单记录、每会话、全局字节以及同时运行的 locator 数量都有上限。
-- metadata 递归搜索使用跨全部根的 20000 条目和 10 秒硬预算；递归、目录指纹及 Host 配额扫描运行于最多 4 个短生命周期子进程。超时会强制终止并等待 `close`；无法确认回收时保留占用槽位，避免残留进程被无限累积。
-- OS 索引按行流式收集 100 个候选，达到输出/时间上限后同样等待进程回收。系统命令使用可信绝对路径、固定非工作区 cwd 和最小环境；POSIX 文件名前使用 `--`。Windows PowerShell 回退会按文件/目录选择 `-File` 或 `-Directory`。
-- Everything CLI 不再通过工作区或普通 PATH 自动发现；需要时将 `DSH_FILE_DROP_EVERYTHING_CLI` 设置为已审查的 `es.exe` 绝对路径。
-- 内容校验失败后，第二轮 metadata 会排除服务器签发的失败候选，再在同一有界范围内继续寻找嵌套原件。
+- metadata 阶段只使用 Node `fs/promises` 在当前/其他活动 Session 工作区以及 Desktop、Documents、Downloads 等可信根中做有界递归扫描；最多访问 20000 个条目，硬预算为 10 秒。
+- 递归扫描、目录指纹和 Host 配额扫描运行于最多 4 个短生命周期 Node 子进程。超时会强制终止并等待 `close`；无法确认回收时保留占用槽位，避免残留进程被无限累积。
+- 不调用 Everything、PowerShell、plocate、mdfind 或其他系统索引命令，也不探测固定磁盘、挂载点或后台索引。
+- 内容校验失败后，第二轮 metadata 会排除服务器签发的失败候选，再在同一组可信根内继续寻找嵌套原件。
 - full 指纹最多自动读取 8 个候选；目录结构/内容指纹最多自动读取 16 个候选，超过后降级为人工选择。
-- 超过 10000 条目或 32 层的截断目录不会自动判定 found；direct/indexed 候选中的 symlink/junction 不会被读取。
-- 搜索授权范围有意包含当前 DSH 进程中的活动工作区、系统文件索引和常用搜索根，可能读取当前工作区之外的候选。
+- 超过 10000 条目或 32 层的截断目录不会自动判定 found；扫描和候选验证都不会跟随 symlink/junction。
+- 搜索范围来自 Host 根据 Session 生成的可信工作区根，并补充固定的用户 Desktop、Documents、Downloads 目录；不再扩展到系统文件索引或其他平台专属搜索根。
 
 ## 会话与本地信任边界
 
@@ -43,12 +43,12 @@ DeepSeek Harness Web 持久插件：把文件或目录拖入会话，按模式�
 - 浏览器跨站 Origin / Sec-Fetch-Site 请求会被拒绝。无 Origin 的本地 CLI 请求仍被允许，因此同一系统账号下的本地调用者属于信任边界。
 - 纯 Node 路径 API 无法彻底消除同一系统账号恶意进程制造的瞬时 reparse-point TOCTOU；写入前后的重复 lstat/realpath 检查用于缩小窗口。
 
-## 跨平台架构
+## 定位架构
 
-- 生成的 `client.js`、`src/host/`、`src/locate/` 与共享协议核心不读取 `process.platform` 或 `navigator.platform`，也不包含原生索引命令。
-- `src/platform/index.js` 是唯一运行时平台选择入口；Windows、Linux、macOS 的路径身份、索引命令、搜索根和隔离子进程环境分别位于独立 adapter。
-- Windows 保留文件名被所有平台统一清洗，这是可移植落盘策略，不是运行时平台分支。
-- GitHub Actions 在 Windows、Ubuntu 与 macOS 上运行同一套测试及 npm 打包检查。
+- `src/locate/` 只使用 Node `fs/promises` 完成路径扫描、目录结构读取和指纹校验，不依赖平台 adapter 或系统索引命令。
+- `src/shared/node-path.js` 使用 Node 原生 `path` 规则统一路径身份；Windows 的大小写处理只保留为路径安全键的一部分，不形成独立平台实现层。
+- `src/locate/isolate.js` 使用普通 Node 子进程执行可终止的文件系统任务，和定位算法本身解耦。
+- GitHub Actions 在 Windows、Ubuntu 与 macOS 上运行同一套 Node 文件系统测试及 npm 打包检查。
 
 ## 文件
 
@@ -62,8 +62,8 @@ DeepSeek Harness Web 持久插件：把文件或目录拖入会话，按模式�
 - `src/shared/contract.js`：浏览器与 Host 共用的路由、协议版本、配额和错误常量。
 - `src/host/`：薄路由/HTTP 壳、设置、上传状态机、安全落盘与清理。
 - `src/locate/`：候选编排、challenge、指纹和可终止隔离任务。
-- `src/platform/`：平台选择入口、公共有界命令执行器及 Windows/Linux/macOS adapter。
-- `test/*.test.mjs`：UI/架构契约、客户端、设置、Host、平台与真实 locator 回归测试。
+- `src/shared/node-path.js`：Node 原生路径规范化和路径身份键。
+- `test/*.test.mjs`：UI/架构契约、客户端、设置、Host、Node 定位与安全回归测试。
 
 ## 安装与验证
 

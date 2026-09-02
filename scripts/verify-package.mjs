@@ -12,7 +12,7 @@ assert.equal(pkg.name, 'dsh-file-drop')
 for (const relative of [
   'index.js', 'client.js', 'src/shared/contract.js', 'src/host/index.js',
   'src/host/safety.js', 'src/host/storage.js', 'src/host/upload-manager.js',
-  'src/locate/isolate-runner.js', 'src/locate/secure-locator.js', 'src/platform/index.js',
+  'src/locate/isolate-runner.js', 'src/locate/secure-locator.js', 'src/shared/node-path.js',
 ]) await access(join(root, relative))
 
 const [host, contract, settings, safety, protocol] = await Promise.all([

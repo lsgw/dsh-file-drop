@@ -3,7 +3,7 @@ import { resolve } from 'node:path'
 import { LOCATE_PROTOCOL_VERSION as PROTOCOL_VERSION } from '../shared/contract.js'
 import { locate } from './locator.js'
 import { HttpError, resolveBaseDir, sessionCwd } from '../host/safety.js'
-import { platformPathKey } from '../platform/index.js'
+import { pathKey } from '../shared/node-path.js'
 
 const CHALLENGE_TTL_MS = 2 * 60 * 1000
 const MAX_CHALLENGES = 1024
@@ -70,7 +70,7 @@ function sameStringArray(left, right) {
 function workspaceKey(value) {
   if (typeof value !== 'string' || value === '') return ''
   const path = resolve(value)
-  return platformPathKey(path)
+  return pathKey(path)
 }
 
 function trustedWorkspaceRoots(ctx, currentWorkspacePath, excludedPaths) {

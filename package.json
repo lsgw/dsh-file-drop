@@ -24,7 +24,6 @@
     "src/shared",
     "src/host",
     "src/locate",
-    "src/platform",
     "cordis.patch.yml",
     "dsh.plugin.json",
     "README.md",

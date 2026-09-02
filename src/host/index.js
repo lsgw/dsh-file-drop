@@ -6,7 +6,7 @@ import { requireBinary, requireJson, requireMethod, sameOriginRequest, sendError
 import { API_PATH } from '../shared/contract.js'
 import { createSecureLocator } from '../locate/secure-locator.js'
 import { FILE_DROP_ROUTE } from '../locate/protocol.js'
-import { platformPathKey } from '../platform/index.js'
+import { pathKey } from '../shared/node-path.js'
 import { createSettingsStore, quotaFromSettings } from './settings.js'
 import {
   MAX_UPLOAD_CONTROL_BYTES,
@@ -21,7 +21,7 @@ async function canonicalPathKey(value) {
   let path
   try { path = await realpath(value) } catch { path = resolve(value) }
   path = resolve(path)
-  return platformPathKey(path)
+  return pathKey(path)
 }
 
 export function createPathLock() {

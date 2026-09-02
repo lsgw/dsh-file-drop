@@ -2,18 +2,12 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { mkdtemp, mkdir, open, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { basename, isAbsolute, join, normalize } from 'node:path'
+import { join, normalize } from 'node:path'
 
 import { readNodeDirectoryStructure } from '../src/locate/directory-node.js'
 import { fullFingerprint, sampleFingerprint, sampleRanges } from '../src/locate/fingerprint.js'
 import { locate } from '../src/locate/locator.js'
 import { activeIsolatedTasks, runIsolatedTask } from '../src/locate/isolate.js'
-import {
-  activePlatformSearchProcesses,
-  executePlatformCommandForTest,
-  indexedSearch,
-  platformAdapterForTest,
-} from '../src/platform/index.js'
 import { SAMPLE_BYTES, SMALL_FILE_BYTES } from '../src/locate/protocol.js'
 
 async function fixture(t, label) {
@@ -84,129 +78,6 @@ test('unconfirmed isolated worker termination retains its slot until close', asy
   assert.equal(activeIsolatedTasks(), 1)
   await waitFor(() => activeIsolatedTasks() === 0)
   await rm(held, { recursive: true })
-})
-
-test('platform index parsing preserves trailing spaces and candidate bounds', async () => {
-  const name = 'name-with-space '
-  const runtime = {
-    platform: 'linux',
-    commandExists: async () => true,
-    exec: async () => Array.from({ length: 150 }, (_, index) => '/tmp/' + index + '/' + name).join('\n'),
-  }
-  const candidates = await indexedSearch(name, 'file', runtime)
-  assert.equal(candidates.length, 100)
-  assert.equal(candidates[0].endsWith(name), true)
-})
-
-
-
-test('Windows PowerShell fallback indexes directories with -Directory', async () => {
-  let script = ''
-  const runtime = {
-    platform: 'win32',
-    home: 'C:/Users/Test',
-    powershellPath: join(tmpdir(), 'powershell.exe'),
-    windowsDrives: async () => [],
-    commandExists: async () => true,
-    exec: async (_command, args) => {
-      script = args.at(-1)
-      return 'C:/Users/Test/target-directory'
-    },
-  }
-  const candidates = await indexedSearch('target-directory', 'directory', runtime)
-  assert.deepEqual(candidates, ['C:/Users/Test/target-directory'])
-  assert.match(script, /-Directory/)
-  assert.doesNotMatch(script, /-File/)
-})
-
-
-
-test('platform search waits for close and retains an unconfirmed process slot', async () => {
-  const pending = executePlatformCommandForTest(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
-    timeoutMs: 30,
-    closeWatchdogMs: 30,
-    killProcess: (child) => {
-      setTimeout(() => child.kill('SIGKILL'), 120)
-      return false
-    },
-  })
-  await assert.rejects(pending, error => error && error.status === 503)
-  assert.equal(activePlatformSearchProcesses(), 1)
-  await waitFor(() => activePlatformSearchProcesses() === 0)
-})
-
-
-
-test('platform output cap kills and reaps the producer before resolving', async () => {
-  const output = await executePlatformCommandForTest(process.execPath, [
-    '-e',
-    "for(let i=0;i<150;i++) console.log('line-'+i); setInterval(() => {}, 1000)",
-  ])
-  assert.equal(output.split('\n').length, 100)
-  assert.equal(activePlatformSearchProcesses(), 0)
-})
-
-test('native index arguments preserve option boundaries and empty providers fall back', async () => {
-  let linuxArgs
-  await indexedSearch('--help', 'file', {
-    platform: 'linux',
-    linuxCommands: ['/usr/bin/plocate'],
-    commandExists: async () => true,
-    exec: async (_command, args) => { linuxArgs = args; return '' },
-  })
-  assert.deepEqual(linuxArgs.slice(-2), ['--', '--help'])
-  await assert.rejects(indexedSearch('file.txt', 'file', {
-    platform: 'linux',
-    linuxCommands: ['/usr/bin/plocate'],
-    commandExists: async () => true,
-    exec: async () => { throw Object.assign(new Error('busy'), { status: 429 }) },
-  }), error => error && error.status === 429)
-
-  const commands = []
-  const runtime = {
-    platform: 'win32',
-    home: 'C:/Users/Test',
-    everythingCommands: [join(tmpdir(), 'es.exe')],
-    powershellPath: join(tmpdir(), 'powershell.exe'),
-    windowsDrives: async () => [],
-    commandExists: async () => true,
-    exec: async (command) => {
-      commands.push(command)
-      return command.endsWith('es.exe') ? '' : 'C:/Users/Test/target.txt'
-    },
-  }
-  assert.deepEqual(await indexedSearch('target.txt', 'file', runtime), ['C:/Users/Test/target.txt'])
-  assert.equal(commands.length, 2)
-  commands.length = 0
-  await indexedSearch('--help', 'file', runtime)
-  assert.equal(commands.some(command => command.endsWith('es.exe')), false)
-})
-
-test('platform host rejects bare commands and uses an absolute PowerShell path', async () => {
-  await assert.rejects(
-    executePlatformCommandForTest('powershell.exe', []),
-    error => error && error.status === 500,
-  )
-  if (process.platform === 'win32') assert.equal(isAbsolute(platformAdapterForTest.powershellPath), true)
-  assert.equal(platformAdapterForTest.everythingCommands.every(isAbsolute), true)
-  const childCwd = await executePlatformCommandForTest(process.execPath, ['-e', 'console.log(process.cwd())'])
-  const expectedCwd = process.platform === 'win32' ? (process.env.SystemRoot || process.env.WINDIR) : '/'
-  assert.equal(normalize(childCwd).toUpperCase(), normalize(expectedCwd).toUpperCase())
-})
-
-test('real Windows PowerShell fallback finds a directory', { skip: process.platform !== 'win32' }, async (t) => {
-  const root = await fixture(t, 'powershell-directory')
-  const name = "indexed';Write-Output NOT_EXECUTED;'-" + process.pid + '-' + Date.now()
-  const target = join(root, name)
-  await mkdir(target)
-  const runtime = {
-    ...platformAdapterForTest,
-    home: root,
-    everythingCommands: [],
-    windowsDrives: async () => [],
-  }
-  const candidates = await indexedSearch(name, 'directory', runtime)
-  assert.equal(candidates.some(path => basename(path) === name), true)
 })
 
 test('sample ranges cover small and large file boundaries', () => {
