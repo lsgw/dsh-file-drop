@@ -32,7 +32,7 @@ async function run(task, payload) {
     return nodeDirectoryContentDigestLocal(payload.path, payload.paths, { budget: { deadline: payload.deadline } })
   }
   if (task === 'measure-drop-root') {
-    const { measureDropRootLocal } = await import('../host-safety.js')
+    const { measureDropRootLocal } = await import('../host/safety.js')
     return measureDropRootLocal(payload.baseDir)
   }
   if (task === 'hold-directory') {

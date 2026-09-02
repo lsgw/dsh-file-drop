@@ -1,10 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
+import { LOCATE_PROTOCOL_VERSION as PROTOCOL_VERSION } from '../shared/contract.js'
 import { locate } from './locator.js'
-import { HttpError, resolveBaseDir, sessionCwd } from '../host-safety.js'
+import { HttpError, resolveBaseDir, sessionCwd } from '../host/safety.js'
 import { platformPathKey } from '../platform/index.js'
 
-const PROTOCOL_VERSION = 2
 const CHALLENGE_TTL_MS = 2 * 60 * 1000
 const MAX_CHALLENGES = 1024
 const MAX_CHALLENGES_PER_SESSION = 32

@@ -4,17 +4,17 @@ import { mkdtemp, mkdir, open, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, isAbsolute, join, normalize } from 'node:path'
 
-import { readNodeDirectoryStructure } from '../locate/directory-node.js'
-import { fullFingerprint, sampleFingerprint, sampleRanges } from '../locate/fingerprint.js'
-import { locate } from '../locate/locator.js'
-import { activeIsolatedTasks, runIsolatedTask } from '../locate/isolate.js'
+import { readNodeDirectoryStructure } from '../src/locate/directory-node.js'
+import { fullFingerprint, sampleFingerprint, sampleRanges } from '../src/locate/fingerprint.js'
+import { locate } from '../src/locate/locator.js'
+import { activeIsolatedTasks, runIsolatedTask } from '../src/locate/isolate.js'
 import {
   activePlatformSearchProcesses,
   executePlatformCommandForTest,
   indexedSearch,
   platformAdapterForTest,
-} from '../platform/index.js'
-import { SAMPLE_BYTES, SMALL_FILE_BYTES } from '../locate/protocol.js'
+} from '../src/platform/index.js'
+import { SAMPLE_BYTES, SMALL_FILE_BYTES } from '../src/locate/protocol.js'
 
 async function fixture(t, label) {
   const root = await mkdtemp(join(tmpdir(), 'dsh-file-drop-' + label + '-'))

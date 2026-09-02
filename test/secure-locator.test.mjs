@@ -4,9 +4,9 @@ import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { HttpError } from '../host-safety.js'
-import { createSecureLocator } from '../locate/secure-locator.js'
-import { sampleFingerprint } from '../locate/fingerprint.js'
+import { HttpError } from '../src/host/safety.js'
+import { createSecureLocator } from '../src/locate/secure-locator.js'
+import { sampleFingerprint } from '../src/locate/fingerprint.js'
 
 async function rejectsStatus(promise, status) {
   await assert.rejects(promise, (error) => error instanceof HttpError && error.status === status)

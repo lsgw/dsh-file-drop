@@ -1,6 +1,10 @@
 import { randomUUID } from 'node:crypto'
 import { isAbsolute } from 'node:path'
 import {
+  MAX_UPLOAD_CONTROL_BYTES, MAX_UPLOAD_MANIFEST_BYTES, UPLOAD_CHUNK_BYTES,
+  UPLOAD_PROTOCOL_VERSION,
+} from '../shared/contract.js'
+import {
   HttpError,
   assertDropRootCapacity,
   cleanupOrphanUploadStages,
@@ -11,18 +15,18 @@ import {
   removeUploadStage,
   resolveBaseDir,
   writeUploadChunk,
-} from '../host-safety.js'
+} from './safety.js'
 import {
   DEFAULT_UPLOAD_QUOTA_BYTES,
   DEFAULT_UPLOAD_QUOTA_ENTRIES,
   LOCATE_MODE_ERROR_CODE,
   LOCATE_MODE_ERROR_MESSAGE,
-} from '../settings.js'
+} from './settings.js'
 
-export const UPLOAD_PROTOCOL_VERSION = 3
-export const UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024
-export const MAX_UPLOAD_MANIFEST_BYTES = 48 * 1024 * 1024
-export const MAX_UPLOAD_CONTROL_BYTES = 1024 * 1024
+export {
+  MAX_UPLOAD_CONTROL_BYTES, MAX_UPLOAD_MANIFEST_BYTES, UPLOAD_CHUNK_BYTES,
+  UPLOAD_PROTOCOL_VERSION,
+}
 const MAX_ACTIVE_UPLOADS = 16
 const UPLOAD_TTL_MS = 10 * 60 * 1000
 const UPLOAD_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/

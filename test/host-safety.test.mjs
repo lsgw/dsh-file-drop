@@ -23,9 +23,9 @@ import {
   sanitizeName,
   verifyUploadStage,
   writeUploadChunk,
-} from '../host-safety.js'
-import { runIsolatedTask } from '../locate/isolate.js'
-import { DEFAULT_UPLOAD_QUOTA_BYTES, QUOTA_ERROR_CODE } from '../settings.js'
+} from '../src/host/safety.js'
+import { runIsolatedTask } from '../src/locate/isolate.js'
+import { DEFAULT_UPLOAD_QUOTA_BYTES, QUOTA_ERROR_CODE } from '../src/host/settings.js'
 
 async function fixture(t, label) {
   const root = await mkdtemp(join(tmpdir(), 'dsh-file-drop-host-' + label + '-'))
@@ -313,6 +313,31 @@ test('clear reports asynchronous quarantine cleanup failures', async (t) => {
   assert.equal(errors.length, 1)
   assert.deepEqual(await measureDropRoot(base), { path: join(base, '.dsh-drops'), size: 4, entries: 2 })
   await rejectsStatus(assertDropRootCapacity(base, 1, 1), 409)
+})
+
+test('cleanup status canonicalizes physical directory aliases', async (t) => {
+  const root = await fixture(t, 'cleanup-alias')
+  const base = join(root, 'workspace')
+  const alias = join(root, 'workspace-alias')
+  await mkdir(join(base, '.dsh-drops'), { recursive: true })
+  await writeFile(join(base, '.dsh-drops', 'locked.txt'), 'data')
+  try {
+    await symlink(base, alias, process.platform === 'win32' ? 'junction' : 'dir')
+  } catch (error) {
+    if (error && (error.code === 'EPERM' || error.code === 'EACCES')) {
+      t.skip('symlink creation is unavailable')
+      return
+    }
+    throw error
+  }
+  await clearDropRoot(base, {
+    removeQuarantineFn: async () => { throw new Error('simulated alias cleanup failure') },
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(dropCleanupStatus(alias), {
+    cleanupPending: false,
+    cleanupError: 'simulated alias cleanup failure',
+  })
 })
 
 test('size timeout is enforced inside one large flat directory', async (t) => {

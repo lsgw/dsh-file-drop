@@ -45,31 +45,45 @@ DeepSeek Harness Web 持久插件：把文件或目录拖入会话，按模式�
 
 ## 跨平台架构
 
-- `client.js`、Host 路由、安全层、locator 与协议核心不读取 `process.platform` 或 `navigator.platform`，也不包含原生索引命令。
-- `platform/index.js` 是唯一运行时平台选择入口；Windows、Linux、macOS 的路径身份、索引命令、搜索根和隔离子进程环境分别位于独立 adapter。
+- 生成的 `client.js`、`src/host/`、`src/locate/` 与共享协议核心不读取 `process.platform` 或 `navigator.platform`，也不包含原生索引命令。
+- `src/platform/index.js` 是唯一运行时平台选择入口；Windows、Linux、macOS 的路径身份、索引命令、搜索根和隔离子进程环境分别位于独立 adapter。
 - Windows 保留文件名被所有平台统一清洗，这是可移植落盘策略，不是运行时平台分支。
 - GitHub Actions 在 Windows、Ubuntu 与 macOS 上运行同一套测试及 npm 打包检查。
 
 ## 文件
 
-- `client.js`：拖拽、回形针、状态、草稿插入和 settings UI。
-- `index.js`：Host 路由、同源校验和物理路径锁。
-- `settings.js`：最新设置 schema、默认值、持久化校验和动态配额换算。
-- `host-safety.js`：清单/分块校验、配额、staging、原子落盘与清理。
-- `upload/manager.js`：上传会话绑定、并发上限、过期回收和 init/chunk/finish/cancel 状态机。
-- `locate/locator.js`：平台无关的候选编排与多阶段内容校验。
-- `locate/isolate.js` / `isolate-runner.js`：并发受限、可强制终止的文件系统隔离任务。
-- `locate/secure-locator.js`：challenge、会话绑定、并发与内存预算。
-- `platform/`：平台选择入口、公共有界命令执行器及 Windows/Linux/macOS adapter。
-- `test/*.test.mjs`：客户端纯函数、设置持久化、Host 路由/文件系统、平台边界和真实 locator 回归测试。
+仓库保留完整源码和测试；npm 安装包只携带生成的 `client.js`、Host 运行源码、元数据与文档，不携带 `src/client/`、`scripts/` 和 `test/`。
+
+- `client.js`：由 esbuild 生成的单一 DSH Web bundle，不直接编辑。
+- `index.js`：只导出 Host 公共入口。
+- `src/client/view.js`：冻结的当前 UI、三个 React 组件和 CSS。
+- `src/client/runtime.js`、`api.js`、`drop-controller.js`：客户端状态、请求与拖拽编排。
+- `src/client/upload-strategy.js` / `locate-strategy.js`：机械隔离的上传与定位流程。
+- `src/shared/contract.js`：浏览器与 Host 共用的路由、协议版本、配额和错误常量。
+- `src/host/`：薄路由/HTTP 壳、设置、上传状态机、安全落盘与清理。
+- `src/locate/`：候选编排、challenge、指纹和可终止隔离任务。
+- `src/platform/`：平台选择入口、公共有界命令执行器及 Windows/Linux/macOS adapter。
+- `test/*.test.mjs`：UI/架构契约、客户端、设置、Host、平台与真实 locator 回归测试。
 
 ## 安装与验证
 
 当前 profile 使用 pnpm patched dependency 固定修改。源码更新后执行：
 
 ```sh
+npm ci
+npm run build
 npm test
 node --test --test-concurrency=1 test/*.test.mjs
+npm run verify:package
+npm run verify:tarball
 ```
 
-客户端修改在 Web 资源刷新后生效；Host 模块修改需要下一次正常重启 `dsh web`。
+验证通过后，将真实 tarball 解包得到的 `package/` 内容镜像到 `pnpm patch dsh-file-drop@1.0.0` 返回的工作目录，再在 profile 根目录执行：
+
+```sh
+pnpm patch-commit <patch-work-directory>
+pnpm install --frozen-lockfile
+node <source-repository>/scripts/verify-package.mjs node_modules/dsh-file-drop
+```
+
+`verify-package.mjs` 应同时对源码目录、tarball 解包目录、patch-work 和最终 `node_modules/dsh-file-drop` 通过。客户端修改在 Web 资源刷新后生效；Host 模块修改需要下一次正常重启 `dsh web`。

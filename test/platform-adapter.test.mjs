@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
-import { createPlatformAdapter } from '../platform/index.js'
+import { createPlatformAdapter } from '../src/platform/index.js'
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
 
@@ -71,13 +71,13 @@ test('each adapter invokes only its injected native index provider', async () =>
 test('production core delegates all runtime platform behavior to platform adapters', async () => {
   const coreFiles = [
     'client.js',
-    'host-safety.js',
     'index.js',
-    'locate/isolate.js',
-    'locate/locator.js',
-    'locate/protocol.js',
-    'locate/secure-locator.js',
-    'upload/manager.js',
+    'src/host/safety.js',
+    'src/host/upload-manager.js',
+    'src/locate/isolate.js',
+    'src/locate/locator.js',
+    'src/locate/protocol.js',
+    'src/locate/secure-locator.js',
   ]
   const forbidden = [
     [/\b(?:process|navigator)\.platform\b/, 'runtime platform branch'],

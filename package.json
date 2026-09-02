@@ -5,7 +5,12 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "build": "node scripts/build-client.mjs",
+    "pretest": "npm run build",
+    "test": "node --test test/*.test.mjs",
+    "verify:package": "node scripts/verify-package.mjs .",
+    "verify:tarball": "node scripts/verify-tarball.mjs",
+    "prepack": "npm test"
   },
   "main": "./index.js",
   "exports": {
@@ -15,15 +20,15 @@
   },
   "files": [
     "index.js",
-    "host-safety.js",
-    "settings.js",
     "client.js",
-    "locate",
-    "platform",
-    "upload",
-    "test",
+    "src/shared",
+    "src/host",
+    "src/locate",
+    "src/platform",
     "cordis.patch.yml",
-    "dsh.plugin.json"
+    "dsh.plugin.json",
+    "README.md",
+    "LICENSE"
   ],
   "dsh": {
     "bundle": {
@@ -50,5 +55,8 @@
     "react": {
       "optional": true
     }
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
   }
 }

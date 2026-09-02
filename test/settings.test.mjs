@@ -11,7 +11,7 @@ import {
   quotaFromSettings,
   validateFileDropSettings,
   validateFileDropSettingsPatch,
-} from '../settings.js'
+} from '../src/host/settings.js'
 
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), 'dsh-file-drop-settings-'))

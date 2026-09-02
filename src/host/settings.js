@@ -1,23 +1,20 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
+import {
+  DEFAULT_SETTINGS, LOCATE_MODE_ERROR_CODE, LOCATE_MODE_ERROR_MESSAGE,
+  MAX_UPLOAD_QUOTA_ENTRIES, MAX_UPLOAD_QUOTA_MIB, MIB_BYTES,
+  QUOTA_ERROR_CODE, QUOTA_ERROR_MESSAGE,
+} from '../shared/contract.js'
 
-export const MIB_BYTES = 1024 * 1024
-export const DEFAULT_UPLOAD_QUOTA_MIB = 10000
-export const DEFAULT_UPLOAD_QUOTA_ENTRIES = 10000
-export const MAX_UPLOAD_QUOTA_MIB = 1024 * 1024
-export const MAX_UPLOAD_QUOTA_ENTRIES = 100000
+export {
+  LOCATE_MODE_ERROR_CODE, LOCATE_MODE_ERROR_MESSAGE, MAX_UPLOAD_QUOTA_ENTRIES,
+  MAX_UPLOAD_QUOTA_MIB, MIB_BYTES, QUOTA_ERROR_CODE, QUOTA_ERROR_MESSAGE,
+}
+export const DEFAULT_UPLOAD_QUOTA_MIB = DEFAULT_SETTINGS.uploadQuotaMiB
+export const DEFAULT_UPLOAD_QUOTA_ENTRIES = DEFAULT_SETTINGS.uploadQuotaEntries
 export const DEFAULT_UPLOAD_QUOTA_BYTES = DEFAULT_UPLOAD_QUOTA_MIB * MIB_BYTES
 export const MAX_UPLOAD_QUOTA_BYTES = MAX_UPLOAD_QUOTA_MIB * MIB_BYTES
-export const QUOTA_ERROR_CODE = 'quota_exceeded'
-export const QUOTA_ERROR_MESSAGE = '已达上传配额，需清理 .dsh-drops'
-export const LOCATE_MODE_ERROR_CODE = 'locate_mode'
-export const LOCATE_MODE_ERROR_MESSAGE = '当前为定位模式，未上传'
-
-export const DEFAULT_FILE_DROP_SETTINGS = Object.freeze({
-  mode: 'upload',
-  uploadQuotaMiB: DEFAULT_UPLOAD_QUOTA_MIB,
-  uploadQuotaEntries: DEFAULT_UPLOAD_QUOTA_ENTRIES,
-})
+export const DEFAULT_FILE_DROP_SETTINGS = DEFAULT_SETTINGS
 
 class SettingsError extends Error {
   constructor(message) {

@@ -6,8 +6,8 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
 import { createPathLock } from '../index.js'
-import { measureDropRoot, removeUploadStage } from '../host-safety.js'
-import { UPLOAD_CHUNK_BYTES, createUploadManager } from '../upload/manager.js'
+import { measureDropRoot, removeUploadStage } from '../src/host/safety.js'
+import { UPLOAD_CHUNK_BYTES, createUploadManager } from '../src/host/upload-manager.js'
 
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), 'dsh-file-drop-manager-'))
