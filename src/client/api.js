@@ -2,9 +2,10 @@ import {
   API_PATH, DEFAULT_SETTINGS, FAIL_CLOSED_SETTINGS, LOCATE_MODE_ERROR_CODE,
   LOCATE_MODE_ERROR_MESSAGE, MAX_NEGOTIATED_CHUNK_BYTES, MAX_UPLOAD_QUOTA_ENTRIES,
   MAX_UPLOAD_QUOTA_MIB, MODE_READ_ERROR_MESSAGE, QUOTA_ERROR_CODE, QUOTA_ERROR_MESSAGE,
-  SETTINGS_PATH, UPLOAD_PATH,
+  SETTINGS_PATH, UPLOAD_PATH, UPLOAD_PROTOCOL_VERSION,
 } from '../shared/contract.js'
-import { statusStore } from './status.js'
+import { clearAllStatuses } from './status.js'
+import { chunkRequest } from './chunk-request.js'
 
 let currentSettings = { ...DEFAULT_SETTINGS }
 let currentMode = currentSettings.mode
@@ -13,6 +14,7 @@ let modeRevision = 0
 let settingsWriteQueue = Promise.resolve()
 let modeChannel
 let modeChannelOwners = 0
+const settingsListeners = new Set()
 const activeControllers = new Set()
 
 function throwIfAborted(signal) {
@@ -61,23 +63,29 @@ async function readSettings(signal, fallback = true) {
 
 function refreshSettings() {
   if (!settingsRefresh) {
-    settingsRefresh = readSettings().then((settings) => {
-      currentSettings = settings
-      return settings
-    }).finally(() => { settingsRefresh = undefined })
+    settingsRefresh = readSettings().then(adoptSettings).finally(() => { settingsRefresh = undefined })
   }
   return settingsRefresh
 }
 
 function adoptSettings(settings) {
+  const changed = settings.mode !== currentSettings.mode
+    || settings.uploadQuotaMiB !== currentSettings.uploadQuotaMiB
+    || settings.uploadQuotaEntries !== currentSettings.uploadQuotaEntries
   currentSettings = settings
   if (settings.mode !== currentMode) {
     abortActiveOperations()
-    statusStore.clear()
+    clearAllStatuses()
     currentMode = settings.mode
     modeRevision += 1
   }
+  if (changed) for (const listener of [...settingsListeners]) listener(settings)
   return settings
+}
+
+function subscribeSettings(listener) {
+  settingsListeners.add(listener)
+  return () => settingsListeners.delete(listener)
 }
 
 function writeSettings(patch) {
@@ -108,7 +116,7 @@ async function refreshModeForAction() {
 
 function beginModeChange(nextMode) {
   abortActiveOperations()
-  statusStore.clear()
+  clearAllStatuses()
   modeRevision += 1
   if (nextMode === 'locate') currentMode = 'locate'
   return currentMode
@@ -177,13 +185,13 @@ function chunkSessionHeaders(sessionId) {
     ? { 'x-dsh-session-scope': 'global' }
     : { 'x-dsh-session-scope': 'session', 'x-dsh-session-id': encodeURIComponent(String(sessionId)) }
 }
-
-async function uploadFileChunks(file, fileIndex, uploadId, chunkBytes, sessionId, signal, onProgress) {
+async function uploadFileChunks(file, fileIndex, uploadId, chunkBytes, sessionId, signal, onProgress,
+  responseTimeoutMs = 45_000) {
   let offset = 0
   while (offset < file.size) {
     throwIfAborted(signal)
     const end = Math.min(offset + chunkBytes, file.size)
-    const response = await fetch(UPLOAD_PATH + '/chunk', {
+    const { response, data } = await chunkRequest(UPLOAD_PATH + '/chunk', {
       method: 'POST',
       headers: {
         'content-type': 'application/octet-stream',
@@ -194,8 +202,7 @@ async function uploadFileChunks(file, fileIndex, uploadId, chunkBytes, sessionId
       },
       body: file.slice(offset, end, 'application/octet-stream'),
       signal,
-    })
-    const data = await response.json().catch(() => ({}))
+    }, responseTimeoutMs)
     if (!response.ok) throw uploadRequestError(data, response.status, '上传分块失败')
     if (data.written !== end || data.size !== file.size) throw new Error('Host 返回了无效的上传进度')
     offset = end
@@ -209,6 +216,7 @@ async function uploadChunked(manifest, files, opts = {}) {
   let uploadId
   try {
     const initialized = await uploadControl('init', {
+      protocolVersion: UPLOAD_PROTOCOL_VERSION,
       ...sessionPayload(opts.sessionId),
       ...manifest,
     }, opts.signal)
@@ -224,7 +232,7 @@ async function uploadChunked(manifest, files, opts = {}) {
       const file = files[index]
       await uploadFileChunks(file, index, uploadId, chunkBytes, opts.sessionId, opts.signal, (written) => {
         if (opts.onProgress) opts.onProgress(completedBytes + written, totalBytes)
-      })
+      }, opts.chunkResponseTimeoutMs)
       completedBytes += file.size
     }
     throwIfAborted(opts.signal)
@@ -275,6 +283,6 @@ function openModeChannel() {
 export {
   abortActiveOperations, adoptSettings, beginModeChange, clearUserUploadRoot, currentMode, currentSettings,
   initializeSettings, modeRevision, openModeChannel, operationController, readSettings,
-  readUserUploadUsage, refreshModeForAction, refreshSettings, throwIfAborted, uploadChunked,
+  readUserUploadUsage, refreshModeForAction, refreshSettings, subscribeSettings, throwIfAborted, uploadChunked,
   uploadFileChunks, validSettings, writeSettings,
 }

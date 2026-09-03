@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -130,16 +130,100 @@ test('v2 retry can exclude current root while retaining other trusted live roots
       ],
     },
   }
-  const { secure, calls } = harness({ ctx })
-  await secure({
-    protocolVersion: 2,
-    phase: 'metadata',
-    sessionId: 'session-1',
-    file,
-    excludedWorkspacePaths: ['C:/trusted'],
+  const calls = []
+  const locateFn = async (request) => {
+    calls.push(structuredClone(request))
+    if (calls.length === 1) return { status: 'sample-required', candidates: ['C:/trusted/file.txt'] }
+    return { status: 'not-found' }
+  }
+  const { secure } = harness({ ctx, locateFn })
+  const metadata = await secure({ protocolVersion: 2, phase: 'metadata', sessionId: 'session-1', file })
+  const sampled = await secure({
+    protocolVersion: 2, phase: 'sample', sessionId: 'session-1', file,
+    digest: '0'.repeat(64), challenge: metadata.challenge,
   })
-  assert.deepEqual(calls[0].workspacePaths, ['D:/other-workspace'])
-  assert.equal(calls[0].currentWorkspacePath, undefined)
+  await secure({
+    protocolVersion: 2, phase: 'metadata', sessionId: 'session-1', file,
+    excludeCurrentWorkspace: true, retryChallenge: sampled.retryChallenge,
+  })
+  assert.deepEqual(calls[2].workspacePaths, ['D:/other-workspace'])
+  assert.equal(calls[2].currentWorkspacePath, undefined)
+})
+
+test('metadata rejects raw client path exclusions', async () => {
+  const { secure, calls } = harness()
+  await rejectsStatus(secure({
+    protocolVersion: 2, phase: 'metadata', sessionId: 'session-1', file,
+    excludedWorkspacePaths: ['\\\\server\\share'],
+  }), 400)
+  await rejectsStatus(secure({
+    protocolVersion: 2, phase: 'metadata', sessionId: 'session-1', file,
+    excludedCandidates: ['C:/outside/file.txt'],
+  }), 400)
+  await rejectsStatus(secure({
+    protocolVersion: 2, phase: 'metadata', sessionId: 'session-1', file,
+    excludeCurrentWorkspace: true,
+  }), 400)
+  assert.equal(calls.length, 0)
+})
+
+test('retry metadata exclusions come only from a completed server challenge', async () => {
+  const calls = []
+  const locateFn = async (request) => {
+    calls.push(structuredClone(request))
+    if (request.phase === 'metadata' && calls.length === 1) {
+      return { status: 'sample-required', candidates: ['C:/trusted/wrong.txt'] }
+    }
+    return { status: 'not-found' }
+  }
+  const { secure } = harness({ locateFn })
+  const metadata = await secure({ protocolVersion: 2, phase: 'metadata', sessionId: 'session-1', file })
+  const sampled = await secure({
+    protocolVersion: 2, phase: 'sample', sessionId: 'session-1', file,
+    digest: '0'.repeat(64), challenge: metadata.challenge,
+  })
+  assert.equal(sampled.status, 'not-found')
+  assert.equal(sampled.retryChallenge, metadata.challenge)
+  await secure({
+    protocolVersion: 2, phase: 'metadata', sessionId: 'session-1', file,
+    excludeCurrentWorkspace: true, retryChallenge: sampled.retryChallenge,
+  })
+  assert.deepEqual(calls[2].excludedCandidates, ['C:/trusted/wrong.txt'])
+  await rejectsStatus(secure({
+    protocolVersion: 2, phase: 'metadata', sessionId: 'session-1', file,
+    retryChallenge: 'missing-token',
+  }), 410)
+})
+
+test('retry challenge is invalidated when an external root is revoked', async () => {
+  let external = {
+    epoch: 1,
+    roots: [{
+      id: '11111111-1111-4111-8111-111111111111',
+      generation: '22222222-2222-4222-8222-222222222222',
+      identity: 'inode:1:2',
+      path: 'D:/external',
+    }],
+  }
+  let calls = 0
+  const locateFn = async () => {
+    calls += 1
+    return calls === 1
+      ? { status: 'sample-required', candidates: ['D:/external/file.txt'] }
+      : { status: 'not-found' }
+  }
+  const { secure } = harness({ locateFn, getExternalSearchRoots: async () => external })
+  const metadata = await secure({ protocolVersion: 2, phase: 'metadata', sessionId: 'session-1', file })
+  const sampled = await secure({
+    protocolVersion: 2, phase: 'sample', sessionId: 'session-1', file,
+    digest: '0'.repeat(64), challenge: metadata.challenge,
+  })
+  external = { epoch: 2, roots: [] }
+  await rejectsStatus(secure({
+    protocolVersion: 2, phase: 'metadata', sessionId: 'session-1', file,
+    excludeCurrentWorkspace: true, retryChallenge: sampled.retryChallenge,
+  }), 409)
+  assert.equal(calls, 2)
 })
 
 test('challenge binds phase, session and immutable metadata', async () => {
@@ -426,6 +510,78 @@ test('continuations reject a removed or rebound session workspace', async () => 
     protocolVersion: 2, phase: 'sample', sessionId: 'session-1', file,
     digest: '0'.repeat(64), challenge: metadata.challenge,
   }), 404)
+})
+
+test('authorized external roots participate in secure file locating', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-file-drop-secure-external-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const workspace = join(root, 'workspace')
+  const external = join(root, 'external')
+  await mkdir(workspace)
+  await mkdir(external)
+  const path = join(external, 'outside.txt')
+  await writeFile(path, 'outside-content')
+  const info = await stat(path)
+  const store = (await import('../src/host/search-roots.js')).createSearchRootStore(join(root, 'roots.json'))
+  const authorized = await store.authorize(external)
+  const canonicalPath = join(authorized.roots[0].path, 'outside.txt')
+  const ctx = {
+    sessions: {
+      get: (id) => id === 'session-external' ? { header: { cwd: workspace } } : undefined,
+      list: () => [{ header: { cwd: workspace } }],
+    },
+  }
+  const secure = createSecureLocator(ctx, { getExternalSearchRoots: () => store.trusted() })
+  const file = { kind: 'file', name: 'outside.txt', size: info.size, lastModified: info.mtimeMs }
+  const metadata = await secure({
+    protocolVersion: 2, phase: 'metadata', sessionId: 'session-external', file,
+    workspacePaths: ['C:/attacker'], currentWorkspacePath: 'C:/attacker',
+  })
+  assert.equal(metadata.status, 'sample-required')
+  assert.deepEqual(metadata.candidates, [canonicalPath])
+  const found = await secure({
+    protocolVersion: 2, phase: 'sample', sessionId: 'session-external', file,
+    digest: await sampleFingerprint(canonicalPath, info.size), challenge: metadata.challenge,
+  })
+  assert.deepEqual(found, { status: 'found', path: canonicalPath })
+  await writeFile(join(workspace, 'outside.txt'), 'outside-content')
+  const globalMetadata = await secure({ protocolVersion: 2, phase: 'metadata', file })
+  assert.deepEqual(globalMetadata.candidates, [canonicalPath])
+  const globalFound = await secure({
+    protocolVersion: 2, phase: 'sample', file,
+    digest: await sampleFingerprint(canonicalPath, info.size), challenge: globalMetadata.challenge,
+  })
+  assert.deepEqual(globalFound, { status: 'found', path: canonicalPath })
+  assert.equal(authorized.roots.length, 1)
+})
+
+test('revoking an external root invalidates its locate challenge', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-file-drop-secure-revoke-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const workspace = join(root, 'workspace')
+  const external = join(root, 'external')
+  await mkdir(workspace)
+  await mkdir(external)
+  const path = join(external, 'revoked.txt')
+  await writeFile(path, 'revoked-content')
+  const info = await stat(path)
+  const module = await import('../src/host/search-roots.js')
+  const store = module.createSearchRootStore(join(root, 'roots.json'))
+  const added = await store.authorize(external)
+  const ctx = {
+    sessions: {
+      get: () => ({ header: { cwd: workspace } }),
+      list: () => [{ header: { cwd: workspace } }],
+    },
+  }
+  const secure = createSecureLocator(ctx, { getExternalSearchRoots: () => store.trusted() })
+  const file = { kind: 'file', name: 'revoked.txt', size: info.size, lastModified: info.mtimeMs }
+  const metadata = await secure({ protocolVersion: 2, phase: 'metadata', sessionId: 'session-revoke', file })
+  await store.revoke(added.roots[0].id)
+  await rejectsStatus(secure({
+    protocolVersion: 2, phase: 'sample', sessionId: 'session-revoke', file,
+    digest: await sampleFingerprint(path, info.size), challenge: metadata.challenge,
+  }), 409)
 })
 
 test('expired challenges and unsupported protocol requests are rejected', async () => {

@@ -7,8 +7,9 @@ function lexicalPath(value) {
   return normalize(resolve(value))
 }
 
-function objectKey(canonical, info) {
-  if (info && typeof info.ino === 'bigint' && info.ino !== 0n) {
+export function objectKey(canonical, info) {
+  if (info && typeof info.dev === 'bigint' && info.dev !== 0n
+    && typeof info.ino === 'bigint' && info.ino !== 0n) {
     return 'inode:' + info.dev + ':' + info.ino
   }
   return 'real:' + canonical
@@ -67,5 +68,8 @@ export async function sameDirectoryEntry(parent, actualName, requestedName, dead
   if (!Number.isFinite(deadline)) return comparison
   const remaining = deadline - Date.now()
   if (remaining <= 0) return false
-  return Promise.race([comparison, new Promise((resolve) => setTimeout(() => resolve(false), remaining))])
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), remaining)
+    comparison.then((result) => { clearTimeout(timer); resolve(result) }, () => { clearTimeout(timer); resolve(false) })
+  })
 }

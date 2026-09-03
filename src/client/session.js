@@ -65,20 +65,14 @@ function currentSessionWorkspacePath(sessions) {
   } catch { return undefined }
 }
 
-function workspaceContext(workspaces, currentWorkspacePath, sessionId) {
+function workspaceContext(_workspaces, _currentWorkspacePath, sessionId) {
   sessionId = normalizeSessionId(sessionId)
-  const items = (workspaces && workspaces.list && workspaces.list.getSnapshot && workspaces.list.getSnapshot().items) || []
-  return {
-    workspacePaths: items.map((item) => item.path),
-    ...(currentWorkspacePath === undefined ? {} : { currentWorkspacePath }),
-    ...(sessionId === undefined ? {} : { sessionId }),
-  }
+  return sessionId === undefined ? {} : { sessionId }
 }
 
 function retryWorkspaceContext(wctx, currentWorkspacePath) {
   return {
-    workspacePaths: wctx.workspacePaths,
-    excludedWorkspacePaths: currentWorkspacePath === undefined ? [] : [currentWorkspacePath],
+    ...(currentWorkspacePath === undefined ? {} : { excludeCurrentWorkspace: true }),
     ...(wctx.sessionId === undefined ? {} : { sessionId: wctx.sessionId }),
   }
 }

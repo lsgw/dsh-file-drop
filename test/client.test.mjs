@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { File } from 'node:buffer'
 import { test } from 'node:test'
+import { locateDroppedFile, readDirectoryStructure } from '../src/client/locate-strategy.js'
 
 let definition
 globalThis.window = {
@@ -31,8 +32,10 @@ test('multi-composer drop ownership never uses registration order as an ambiguou
 
 test('upload and locate mode actions are mutually exclusive', () => {
   assert.deepEqual(client.chooseDropAction('upload', { fileCount: 1 }), { type: 'upload-files' })
-  assert.deepEqual(client.chooseDropAction('upload', { directoryCount: 1, fileCount: 1 }), { type: 'upload-directories' })
-  assert.deepEqual(client.chooseDropAction('locate', { directoryCount: 1, fileCount: 1 }), { type: 'locate-directories' })
+  assert.deepEqual(client.chooseDropAction('upload', { directoryCount: 1, fileCount: 1 }), { type: 'upload-mixed' })
+  assert.deepEqual(client.chooseDropAction('locate', { directoryCount: 1, fileCount: 1 }), { type: 'locate-mixed' })
+  assert.deepEqual(client.chooseDropAction('upload', { directoryCount: 1 }), { type: 'upload-directories' })
+  assert.deepEqual(client.chooseDropAction('locate', { directoryCount: 1 }), { type: 'locate-directories' })
   assert.deepEqual(client.chooseDropAction('locate', { fileCount: 1 }), { type: 'locate-files' })
   assert.deepEqual(client.chooseDropAction('locate', {}), { type: 'none' })
 })
@@ -50,7 +53,7 @@ test('upload always copies file content in bounded chunks without reading an ori
     requests.push({ url, options })
     if (url.endsWith('/init')) {
       const body = JSON.parse(options.body)
-      assert.deepEqual(body, { sessionId: 'session / 中文', kind: 'file', name: 'original.txt', size: 7 })
+      assert.deepEqual(body, { protocolVersion: 3, sessionId: 'session / 中文', kind: 'file', name: 'original.txt', size: 7 })
       return { ok: true, json: async () => ({ uploadId: 'upload-1', chunkBytes: 4, fileCount: 1, totalBytes: 7 }) }
     }
     if (url.endsWith('/chunk')) {
@@ -92,14 +95,76 @@ test('upload always copies file content in bounded chunks without reading an ori
 })
 
 test('retry context excludes the previous workspace', () => {
-  assert.deepEqual(client.retryWorkspaceContext({
-    workspacePaths: ['C:\\Work', 'D:\\Other'],
-    sessionId: 'session-1',
-  }, 'C:\\Work'), {
-    workspacePaths: ['C:\\Work', 'D:\\Other'],
-    excludedWorkspacePaths: ['C:\\Work'],
+  assert.deepEqual(client.retryWorkspaceContext({ sessionId: 'session-1' }, 'C:\\Work'), {
+    excludeCurrentWorkspace: true,
     sessionId: 'session-1',
   })
+})
+
+test('external root API sends exact authorization and revoke actions', async (t) => {
+  const originalFetch = globalThis.fetch
+  const requests = []
+  t.after(() => { globalThis.fetch = originalFetch })
+  let response = { epoch: 0, roots: [] }
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, options })
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => response }
+    const body = JSON.parse(options.body)
+    if (body.action === 'authorize') response = {
+      epoch: 1, roots: [{ id: '11111111-1111-4111-8111-111111111111', path: '/external', available: true }],
+    }
+    if (body.action === 'revoke') response = { epoch: 2, roots: [] }
+    return { ok: true, status: 200, json: async () => response }
+  }
+  assert.deepEqual(await client.readExternalSearchRoots(), { epoch: 0, roots: [] })
+  assert.deepEqual(await client.authorizeExternalSearchRoot('/external'), response)
+  assert.deepEqual(await client.revokeExternalSearchRoot('11111111-1111-4111-8111-111111111111'), response)
+  assert.deepEqual(requests.map(({ url, options }) => [url, options.method, options.body]), [
+    ['/api/dsh-file-drop/search-roots', 'GET', undefined],
+    ['/api/dsh-file-drop/search-roots', 'POST', JSON.stringify({ action: 'authorize', path: '/external' })],
+    ['/api/dsh-file-drop/search-roots', 'POST', JSON.stringify({ action: 'revoke', id: '11111111-1111-4111-8111-111111111111' })],
+  ])
+})
+
+test('external root response validation rejects NUL paths', () => {
+  assert.equal(client.validExternalSearchRoots({ epoch: 0, roots: [{
+    id: '11111111-1111-4111-8111-111111111111', path: 'C:/bad\0', available: true,
+  }] }), false)
+})
+
+test('client does not exclude a workspace without a server retry challenge', async (t) => {
+  const originalFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = originalFetch })
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls += 1
+    return { ok: true, status: 200, json: async () => ({ status: 'not-found' }) }
+  }
+  const result = await locateDroppedFile(new File(['x'], 'x.txt'), {}, '/work', 'session-1')
+  assert.equal(result.status, 'not-found')
+  assert.equal(calls, 1)
+})
+
+test('client retry sends a server challenge instead of raw candidate paths', async (t) => {
+  const originalFetch = globalThis.fetch
+  const requests = []
+  t.after(() => { globalThis.fetch = originalFetch })
+  const responses = [
+    { status: 'sample-required', candidates: ['/wrong.txt'], challenge: 'retry-token' },
+    { status: 'not-found', retryChallenge: 'retry-token' },
+    { status: 'not-found' },
+  ]
+  globalThis.fetch = async (_url, options) => {
+    requests.push(JSON.parse(options.body))
+    return { ok: true, status: 200, json: async () => responses.shift() }
+  }
+  const result = await locateDroppedFile(new File(['x'], 'x.txt'), {}, '/work', 'session-1')
+  assert.equal(result.status, 'not-found')
+  assert.equal(requests.length, 3)
+  assert.equal(requests[2].retryChallenge, 'retry-token')
+  assert.equal(requests[2].excludeCurrentWorkspace, true)
+  assert.equal(Object.hasOwn(requests[2], 'excludedCandidates'), false)
+  assert.equal(Object.hasOwn(requests[2], 'excludedWorkspacePaths'), false)
 })
 
 test('complete settings refresh is shared and failures fall closed to locate', async (t) => {
@@ -252,6 +317,31 @@ test('client chunk uploader preserves arbitrary bytes without a whole-file read'
   assert.deepEqual(Buffer.concat(received), Buffer.from(source))
 })
 
+test('client times out a chunk whose response never settles', async (t) => {
+  const originalFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = originalFetch })
+  let cancelled = false
+  let releaseChunk
+  globalThis.fetch = async (url) => {
+    if (url.endsWith('/init')) {
+      return { ok: true, json: async () => ({ uploadId: 'stalled-upload', chunkBytes: 1, fileCount: 1, totalBytes: 1 }) }
+    }
+    if (url.endsWith('/chunk')) return new Promise((resolve) => { releaseChunk = resolve })
+    if (url.endsWith('/cancel')) {
+      cancelled = true
+      return { ok: true, json: async () => ({ cancelled: true }) }
+    }
+    throw new Error('unexpected URL: ' + url)
+  }
+  await assert.rejects(client.uploadChunked(
+    { kind: 'file', name: 'x.bin', size: 1 }, [new File(['x'], 'x.bin')],
+    { chunkResponseTimeoutMs: 10 },
+  ), /响应超时/)
+  assert.equal(cancelled, true)
+  releaseChunk({ ok: true, json: async () => ({ written: 1, size: 1 }) })
+  await new Promise((resolve) => setImmediate(resolve))
+})
+
 test('client cancels staging after a chunk fails', async (t) => {
   const originalFetch = globalThis.fetch
   t.after(() => { globalThis.fetch = originalFetch })
@@ -393,6 +483,79 @@ test('standard file system handles adapt to the directory entry contract', async
   const entries = await client.readEntryAll(directories[0], 501, { count: 0, entries: 0 })
   assert.equal(entries[0].path, 'child.txt')
   assert.equal(entries[0].file.name, 'child.txt')
+  const repeated = await client.readEntryAll(directories[0], 501, { count: 0, entries: 0 })
+  assert.equal(repeated[0].path, 'child.txt')
+})
+
+test('directory handles are requested in the drop event turn', async () => {
+  let phase = 'drop'
+  let calls = 0
+  const item = (name) => ({
+    getAsFileSystemHandle() {
+      if (phase !== 'drop') throw new Error('handle request left the drop event')
+      calls += 1
+      return Promise.resolve({
+        kind: 'directory', name,
+        values: () => ({ next: async () => ({ done: true }) }),
+      })
+    },
+  })
+  const pending = client.getDirectoryEntries([item('one'), item('two')])
+  phase = 'after-drop'
+  const directories = await pending
+  assert.equal(calls, 2)
+  assert.deepEqual(directories.map((directory) => directory.name), ['one', 'two'])
+})
+
+test('standard handles classify mixed top-level files and directories', async () => {
+  const directoryHandle = {
+    kind: 'directory', name: 'folder',
+    values: () => ({ next: async () => ({ done: true }) }),
+  }
+  const fileHandle = {
+    kind: 'file', name: 'note.txt',
+    getFile: async () => new File(['x'], 'note.txt'),
+  }
+  const dropped = await client.getDroppedEntries([
+    { getAsFileSystemHandle: () => Promise.resolve(directoryHandle) },
+    { getAsFileSystemHandle: () => Promise.resolve(fileHandle) },
+    {
+      kind: 'file',
+      getAsFile: () => new File(['y'], 'fallback.txt'),
+      getAsFileSystemHandle: () => Promise.reject(new Error('handle denied')),
+    },
+  ])
+  assert.equal(dropped.handled, true)
+  assert.equal(dropped.failed, false)
+  assert.deepEqual(dropped.directories.map((entry) => entry.name), ['folder'])
+  assert.deepEqual(dropped.files.map((file) => file.name), ['note.txt', 'fallback.txt'])
+})
+
+test('unreadable dropped items fail the batch instead of disappearing', async () => {
+  const dropped = await client.getDroppedEntries([{
+    kind: 'file',
+    getAsFileSystemHandle: () => Promise.reject(new Error('handle denied')),
+  }])
+  assert.equal(dropped.failed, true)
+  assert.deepEqual(dropped.files, [])
+})
+
+test('directory handle collection preserves the first over-limit entry', async () => {
+  const items = Array.from({ length: 33 }, (_, index) => ({
+    getAsFileSystemHandle: () => Promise.resolve({
+      kind: 'directory', name: 'root-' + index,
+      values: () => ({ next: async () => ({ done: true }) }),
+    }),
+  }))
+  const directories = await client.getDirectoryEntries(items)
+  assert.equal(directories.length, 33)
+})
+
+test('directory locate structure truncates before its JSON byte budget', async () => {
+  const root = directoryEntry([fileEntry('a'.repeat(80) + '.txt')])
+  const structure = await readDirectoryStructure(root, undefined, 40)
+  assert.equal(structure.truncated, true)
+  assert.deepEqual(structure.entries, [])
 })
 
 test('client directory upload sends a content-free manifest and streams file bytes', async (t) => {
@@ -433,6 +596,7 @@ test('client directory upload sends a content-free manifest and streams file byt
   })
 
   assert.deepEqual(manifest, {
+    protocolVersion: 3,
     kind: 'directory',
     name: 'root',
     entries: [

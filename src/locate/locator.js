@@ -1,6 +1,6 @@
 // dsh-file-drop / locate engine — multi-phase file/directory locator.
-import { basename, dirname, join, normalize } from 'node:path'
-import { lstat, opendir } from 'node:fs/promises'
+import { basename, dirname, isAbsolute, join, normalize, relative, sep } from 'node:path'
+import { lstat, opendir, realpath } from 'node:fs/promises'
 import {
   DIRECTORY_MAX_ENTRIES,
   DIRECTORY_SAMPLE_FILES,
@@ -80,7 +80,7 @@ async function isolatedRecursiveCandidates(item, roots, budget) {
     deadline: budget.deadline,
   }, { timeoutMs: remaining, maxOutputBytes: 4 * 1024 * 1024 })
   budget.visited = result.visited
-  return validateCandidates(item, result.paths, budget)
+  return validateCandidates(item, result.paths, budget, roots)
 }
 
 async function directCandidate(root, name, kind, budget) {
@@ -159,14 +159,45 @@ async function walkByName(root, name, kind, budget, depth = WALK_DEPTH) {
   return found
 }
 
-async function validateCandidates(item, paths, budget) {
+function pathInside(root, candidate) {
+  const value = relative(root, candidate)
+  return value === '' || (value !== '..' && !value.startsWith('..' + sep) && !isAbsolute(value))
+}
+
+async function canonicalRoots(roots, budget) {
+  if (roots === undefined) return undefined
+  const paths = []
+  for (const root of [...new Set(Array.isArray(roots) ? roots : [])].slice(0, MAX_WORKSPACE_ROOTS)) {
+    try {
+      const canonical = budget ? await beforeDeadline(realpath(root), budget) : await realpath(root)
+      paths.push(normalize(canonical))
+    } catch (error) {
+      if (error?.status === 503) throw error
+    }
+  }
+  return paths
+}
+
+async function candidateInsideRoots(path, roots, budget) {
+  if (roots === undefined) return true
+  if (roots.length === 0) return false
+  const canonical = budget ? await beforeDeadline(realpath(path), budget) : await realpath(path)
+  return roots.some((root) => pathInside(root, normalize(canonical)))
+}
+
+async function validateCandidates(item, paths, budget, trustedRootPaths) {
+  const roots = await canonicalRoots(trustedRootPaths, budget)
   const candidates = []
   for (const path of [...new Set(paths)].slice(0, MAX_DISCOVERED_CANDIDATES)) {
     if (budget && Date.now() >= budget.deadline) throw deadlineError()
     try {
       const info = budget ? await beforeDeadline(lstat(path), budget) : await lstat(path)
       const kindMatches = item.kind === 'file' ? info.isFile() && info.size === item.size : info.isDirectory()
-      if (kindMatches && await sameDirectoryEntry(dirname(path), basename(path), item.name, budget && budget.deadline)) candidates.push({ path: normalize(path), mtimeMs: info.mtimeMs })
+      if (kindMatches
+        && await sameDirectoryEntry(dirname(path), basename(path), item.name, budget && budget.deadline)
+        && await candidateInsideRoots(path, roots, budget)) {
+        candidates.push({ path: normalize(path), mtimeMs: info.mtimeMs })
+      }
     } catch (error) {
       if (error?.status === 429 || error?.status === 503) throw error
       // Candidate disappeared between lookup and validation.
@@ -193,7 +224,7 @@ async function recursiveCandidates(item, roots, budget) {
     if (budget.visited >= MAX_WALK_ENTRIES || Date.now() >= budget.deadline) break
     paths.push(...await walkByName(root, item.name, item.kind, budget))
   }
-  return validateCandidates(item, paths, budget)
+  return validateCandidates(item, paths, budget, roots)
 }
 
 async function metadataCandidates(item, request) {
@@ -229,7 +260,7 @@ async function metadataCandidates(item, request) {
   for (const roots of rootGroups) {
     paths.push(...await directCandidates(item, roots, directBudget))
   }
-  let knownCandidates = await withoutExcluded(await validateCandidates(item, paths, { deadline: Date.now() + WALK_TIMEOUT_MS }))
+  let knownCandidates = await withoutExcluded(await validateCandidates(item, paths, { deadline: Date.now() + WALK_TIMEOUT_MS }, workspaceRoots))
   if (knownCandidates.length > 0) return knownCandidates
 
   const recursivePaths = []
@@ -240,7 +271,7 @@ async function metadataCandidates(item, request) {
     recursivePaths.push(...(await isolatedRecursiveCandidates(item, roots, budget)).map(candidate => candidate.path))
   }
   paths.push(...recursivePaths)
-  knownCandidates = await withoutExcluded(await validateCandidates(item, paths, budget))
+  knownCandidates = await withoutExcluded(await validateCandidates(item, paths, budget, workspaceRoots))
   return knownCandidates
 }
 
@@ -252,7 +283,8 @@ async function matchingFileDigest(candidates, digest, phase, file) {
     try {
       const info = await beforeDeadline(lstat(path), budget)
       if (!info.isFile() || info.size !== file.size || !await sameDirectoryEntry(dirname(path), basename(path), file.name, budget.deadline)) continue
-      const fingerprint = phase === 'sample' ? sampleFingerprint(path, file.size) : fullFingerprint(path)
+      const fingerprint = phase === 'sample'
+        ? sampleFingerprint(path, file.size, info) : fullFingerprint(path, info)
       const actual = await beforeDeadline(fingerprint, budget)
       if (actual === digest) matched.push(normalize(path))
     } catch (error) {
@@ -269,18 +301,21 @@ async function locateDirectoryStructure(request) {
     return { status: 'error', message: 'directory structure phase requires valid candidates and structure' }
   }
   const budget = { deadline: Date.now() + WALK_TIMEOUT_MS }
-  const candidates = (await validateCandidates(request.file, requestedCandidates, budget)).map(candidate => candidate.path)
+  const candidates = (await validateCandidates(request.file, requestedCandidates, budget, request.workspacePaths)).map(candidate => candidate.path)
   if (candidates.length === 0) return { status: 'not-found' }
   if (request.file.structure.truncated || candidates.length > MAX_DIRECTORY_DIGEST_CANDIDATES) {
     return { status: 'choose', candidates }
   }
   const expected = directoryStructureDigest(request.file.structure)
+  const roots = await canonicalRoots(request.workspacePaths, budget)
   const matched = []
   let samplePaths = selectDirectorySamplePaths(request.file.structure.entries)
   for (const path of candidates) {
     try {
       const actual = await nodeDirectoryStructureDigest(path, { budget })
-      if (actual.digest === expected) { matched.push(path); samplePaths = actual.paths }
+      if (actual.digest === expected && await candidateInsideRoots(path, roots, budget)) {
+        matched.push(path); samplePaths = actual.paths
+      }
     } catch (error) {
       if (error?.status === 429 || error?.status === 503) throw error
       // Ignore unreadable directories.
@@ -301,7 +336,8 @@ export async function locate(request) {
     || request.file.name.includes('\0')
     || request.file.name === '.'
     || request.file.name === '..'
-    || /[\\/]/.test(request.file.name)
+    || request.file.name.includes('/')
+    || (sep === '\\' && request.file.name.includes('\\'))
     || (request.file.kind === 'file' && (!Number.isSafeInteger(request.file.size) || request.file.size < 0))
     || (request.file.kind === 'file' && request.file.lastModified !== undefined && !Number.isFinite(request.file.lastModified))) {
     return { status: 'error', message: 'invalid dropped entry metadata' }
@@ -319,15 +355,17 @@ export async function locate(request) {
       return { status: 'error', message: 'invalid directory phase' }
     }
     const budget = { deadline: Date.now() + WALK_TIMEOUT_MS }
-    const candidates = (await validateCandidates(request.file, requestedCandidates, budget)).map(candidate => candidate.path)
+    const candidates = (await validateCandidates(request.file, requestedCandidates, budget, request.workspacePaths)).map(candidate => candidate.path)
     if (candidates.length === 0) return { status: 'not-found' }
     if (candidates.length > MAX_DIRECTORY_DIGEST_CANDIDATES) return { status: 'choose', candidates }
     const expected = directoryContentDigest(request.directorySamples)
     const paths = request.directorySamples.map(sample => sample.path)
+    const roots = await canonicalRoots(request.workspacePaths, budget)
     const matched = []
     for (const path of candidates) {
       try {
-        if (await nodeDirectoryContentDigest(path, paths, { budget }) === expected) matched.push(path)
+        if (await nodeDirectoryContentDigest(path, paths, { budget }) === expected
+          && await candidateInsideRoots(path, roots, budget)) matched.push(path)
       } catch (error) {
         if (error?.status === 429 || error?.status === 503) throw error
         // Ignore unreadable directories.
@@ -351,7 +389,7 @@ export async function locate(request) {
     return { status: 'error', message: 'full digest exceeds safe size limit' }
   }
   if (request.phase === 'full' && candidates.length > MAX_FULL_CANDIDATES) {
-    const valid = (await validateCandidates(request.file, candidates, { deadline: Date.now() + WALK_TIMEOUT_MS }))
+    const valid = (await validateCandidates(request.file, candidates, { deadline: Date.now() + WALK_TIMEOUT_MS }, request.workspacePaths))
       .map(candidate => candidate.path)
     return valid.length === 0 ? { status: 'not-found' } : { status: 'choose', candidates: valid }
   }

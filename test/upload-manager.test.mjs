@@ -7,7 +7,7 @@ import { join, resolve } from 'node:path'
 
 import { createPathLock } from '../index.js'
 import { measureDropRoot, removeUploadStage } from '../src/host/safety.js'
-import { UPLOAD_CHUNK_BYTES, createUploadManager } from '../src/host/upload-manager.js'
+import { UPLOAD_CHUNK_BYTES, UPLOAD_PROTOCOL_VERSION, createUploadManager } from '../src/host/upload-manager.js'
 
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), 'dsh-file-drop-manager-'))
@@ -37,7 +37,7 @@ function createManager(cwdRef, now = Date.now, getSettings, options = {}) {
     sessions: { get: (id) => id === 'valid' ? { header: { cwd: cwdRef.value } } : undefined },
     logger: { warn() {} },
   }
-  return createUploadManager(ctx, {
+  const manager = createUploadManager(ctx, {
     withPathLock: options.withPathLock || createPathLock(),
     canonicalPathKey,
     uploadBaseDir: options.uploadBaseDir || cwdRef.value,
@@ -45,8 +45,22 @@ function createManager(cwdRef, now = Date.now, getSettings, options = {}) {
     ...(getSettings ? { getSettings } : {}),
     ...(options.removeStage ? { removeStage: options.removeStage } : {}),
     ...(options.commitStage ? { commitStage: options.commitStage } : {}),
+    ...(options.chunkTimeoutMs ? { chunkTimeoutMs: options.chunkTimeoutMs } : {}),
+  })
+  return Object.freeze({
+    ...manager,
+    initRaw: manager.init,
+    init: (payload) => manager.init({ protocolVersion: UPLOAD_PROTOCOL_VERSION, ...payload }),
   })
 }
+
+test('upload manager requires protocol v3 before touching storage', async (t) => {
+  const root = await fixture(t)
+  const manager = createManager({ value: root })
+  await assert.rejects(manager.initRaw({ sessionId: 'valid', kind: 'file', name: 'x', size: 0 }), (error) => error.status === 426)
+  await assert.rejects(manager.initRaw({ protocolVersion: 2, sessionId: 'valid', kind: 'file', name: 'x', size: 0 }), (error) => error.status === 426)
+  assert.equal(manager.activeCount(), 0)
+})
 
 test('upload manager binds the session but always commits to the user upload root', async (t) => {
   const firstWorkspace = await fixture(t)
@@ -300,6 +314,25 @@ test('finish cannot commit after a concurrent cancel leaves cleanup pending', as
   assert.equal(manager.activeCount(), 1)
   locked = false
   await manager.cleanupBase()
+  assert.equal(manager.activeCount(), 0)
+})
+
+test('never-ending chunk requests time out and release the upload lock', async (t) => {
+  const root = await fixture(t)
+  const cwdRef = { value: root }
+  const manager = createManager(cwdRef, Date.now, undefined, { chunkTimeoutMs: 20 })
+  const initialized = await manager.init({ sessionId: 'valid', kind: 'file', name: 'stalled.bin', size: 1 })
+  const req = new Readable({ read() {} })
+  req.headers = {
+    'content-length': '1',
+    'x-dsh-upload-id': initialized.uploadId,
+    'x-dsh-file-index': '0',
+    'x-dsh-upload-offset': '0',
+    'x-dsh-session-scope': 'session',
+    'x-dsh-session-id': 'valid',
+  }
+  await assert.rejects(manager.chunk(req), (error) => error && error.status === 408)
+  assert.deepEqual(await manager.cancel({ sessionId: 'valid', uploadId: initialized.uploadId }), { cancelled: true })
   assert.equal(manager.activeCount(), 0)
 })
 

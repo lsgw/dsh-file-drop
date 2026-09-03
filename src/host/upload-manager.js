@@ -74,6 +74,7 @@ export function createUploadManager(ctx, options) {
     throw new TypeError('uploadBaseDir must be an absolute path')
   }
   const now = options.now || Date.now
+  const chunkTimeoutMs = options.chunkTimeoutMs || 30_000
   const removeStage = options.removeStage || removeUploadStage
   const commitStage = options.commitStage || commitUploadStage
   const getSettings = options.getSettings || (() => ({
@@ -160,6 +161,9 @@ export function createUploadManager(ctx, options) {
   }
 
   async function init(payload) {
+    if (!payload || payload.protocolVersion !== UPLOAD_PROTOCOL_VERSION) {
+      throw new HttpError(426, 'upload protocol v3 is required; refresh the page')
+    }
     return withInitLock(async () => {
       const binding = sessionBinding(payload)
       validateLiveBinding(binding)
@@ -263,7 +267,7 @@ export function createUploadManager(ctx, options) {
           throw new HttpError(404, 'upload session not found')
         }
         validateLiveBinding(binding)
-        const result = await writeUploadChunk(req, state.stage, fileIndex, offset, UPLOAD_CHUNK_BYTES)
+        const result = await writeUploadChunk(req, state.stage, fileIndex, offset, UPLOAD_CHUNK_BYTES, { timeoutMs: chunkTimeoutMs })
         state.lastSeen = now()
         return result
       })

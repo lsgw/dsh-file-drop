@@ -1,21 +1,23 @@
 import {
   MAX_ROOT_DIRECTORIES, MAX_TOP_LEVEL_FILES, MAX_UPLOAD_QUOTA_ENTRIES,
   MAX_UPLOAD_QUOTA_MIB, MIB_BYTES, MODE_READ_ERROR_MESSAGE, QUOTA_ERROR_MESSAGE,
-  abortableDelay, adoptSettings, beginModeChange, claimedDropEvents, clearUserUploadRoot, currentMode,
-  currentSessionMatches, currentSessionWorkspacePath, currentSettings,
-  dropOwners, formatSize, getDirectoryEntries, modeRevision, normalizeSessionId,
-  operationController, processDirectoryLocate, processDirectoryUpload, processFilesLocate,
-  processFilesUpload, readUserUploadUsage, refreshModeForAction, refreshSettings,
-  selectDropOwner, shouldHandleDataTransfer, statusStore, writeSettings,
+  abortableDelay, adoptSettings, beginModeChange, claimedDropEvents, clearUserUploadRoot,
+  composerStatusStore, currentMode, currentSessionMatches, currentSessionWorkspacePath, currentSettings,
+  dropOwners, formatSize, getDroppedEntries, modeRevision, normalizeSessionId, operationController,
+  processDirectoryLocate, processDirectoryUpload, processFilesLocate, processFilesUpload,
+  readUserUploadUsage, refreshModeForAction, refreshSettings, selectDropOwner,
+  shouldHandleDataTransfer, subscribeSettings, writeSettings,
   chooseDropAction,
 } from './runtime.js'
+import { createSearchRootSettings } from './search-root-view.js'
 
 export function createView(React) {
-  function useStatus() {
+  const SearchRootSettings = createSearchRootSettings(React)
+  function useStatus(store) {
     return React.useSyncExternalStore(
-      (listener) => statusStore.subscribe(listener),
-      () => statusStore.value,
-      () => statusStore.value
+      (listener) => store.subscribe(listener),
+      () => store.value,
+      () => store.value
     )
   }
 
@@ -23,10 +25,12 @@ export function createView(React) {
 
   // 输入框工具行：回形针按钮（点开文件选择器）
   function PaperclipButton(props) {
+    const statuses = composerStatusStore(props.inputActions)
     const pickRef = React.useRef(null)
     const ownerRef = React.useRef(null)
     const operationRef = React.useRef(0)
     const operationHandleRef = React.useRef(null)
+    const mountedRef = React.useRef(true)
     const optsRef = React.useRef({})
     optsRef.current = {
       sessionId: normalizeSessionId(props.sessionId),
@@ -38,6 +42,7 @@ export function createView(React) {
     }
     const cancelCurrent = () => {
       operationRef.current += 1
+      statuses.clear()
       const handle = operationHandleRef.current
       operationHandleRef.current = null
       if (handle) { handle.controller.abort(); handle.release() }
@@ -50,25 +55,32 @@ export function createView(React) {
         if (!currentSessionMatches(props.sessions, optsRef.current.sessionId)) cancelCurrent()
       })
     }, [props.sessions])
-    React.useEffect(() => () => { cancelCurrent() }, [])
+    React.useEffect(() => {
+      mountedRef.current = true
+      return () => { mountedRef.current = false; cancelCurrent() }
+    }, [])
     const onClick = () => { if (pickRef.current) pickRef.current.click() }
     const onChange = (e) => {
       const files = Array.from(e.target.files || [])
       e.target.value = ''
       if (files.length === 0) return
       cancelCurrent()
+      const preflightId = operationRef.current
       const started = { ...optsRef.current }
-      const modeStatus = statusStore.begin('正在确认拖拽模式…')
+      const modeStatus = statuses.begin('正在确认拖拽模式…')
       void (async () => {
         let mode
         try { mode = await refreshModeForAction() } catch {
-          statusStore.finish(modeStatus, '✗ ' + MODE_READ_ERROR_MESSAGE)
+          if (mountedRef.current && operationRef.current === preflightId) {
+            statuses.finish(modeStatus, '✗ ' + MODE_READ_ERROR_MESSAGE)
+          }
           return
         }
-        statusStore.cancel(modeStatus)
-        if (optsRef.current.sessionId !== started.sessionId
+        if (!mountedRef.current || operationRef.current !== preflightId
+          || optsRef.current.sessionId !== started.sessionId
           || optsRef.current.inputActions !== started.inputActions
           || !currentSessionMatches(props.sessions, started.sessionId)) return
+        statuses.cancel(modeStatus)
         const handle = operationController()
         operationHandleRef.current = handle
         const operationId = ++operationRef.current
@@ -77,9 +89,11 @@ export function createView(React) {
           mode,
           modeRevision,
           signal: handle.controller.signal,
+          statusStore: statuses,
           getDraft: () => optsRef.current.draft,
         }
-        snapshot.isActive = () => operationRef.current === operationId
+        snapshot.isActive = () => mountedRef.current
+          && operationRef.current === operationId
           && !snapshot.signal.aborted
           && optsRef.current.sessionId === snapshot.sessionId
           && optsRef.current.inputActions === snapshot.inputActions
@@ -89,7 +103,7 @@ export function createView(React) {
         try {
           if (snapshot.mode === 'locate') {
             if (files.length > MAX_TOP_LEVEL_FILES) {
-              statusStore.show('✗ 一次最多处理 ' + MAX_TOP_LEVEL_FILES + ' 个文件')
+              statuses.show('✗ 一次最多处理 ' + MAX_TOP_LEVEL_FILES + ' 个文件')
               return
             }
             await processFilesLocate(files, snapshot)
@@ -131,15 +145,17 @@ export function createView(React) {
 
   // 输入框上方 dock：拖拽监听 + 浮层 + 状态条
   function DropZone(props) {
+    const statuses = composerStatusStore(props.inputActions)
     const [drag, setDrag] = React.useState(false)
     const ownerRef = React.useRef(null)
-    const statusText = useStatus()
+    const statusText = useStatus(statuses)
     const [statusBottom, setStatusBottom] = React.useState(110)
     const [statusLeft, setStatusLeft] = React.useState('50%')
     const depthRef = React.useRef(0)
     const busyRef = React.useRef(false)
     const operationRef = React.useRef(0)
     const operationHandleRef = React.useRef(null)
+    const mountedRef = React.useRef(true)
     const optsRef = React.useRef({})
     optsRef.current = {
       sessionId: normalizeSessionId(props.sessionId),
@@ -162,6 +178,7 @@ export function createView(React) {
     const cancelCurrent = () => {
       operationRef.current += 1
       busyRef.current = false
+      statuses.clear()
       const handle = operationHandleRef.current
       operationHandleRef.current = null
       if (handle) { handle.controller.abort(); handle.release() }
@@ -169,8 +186,8 @@ export function createView(React) {
 
     React.useEffect(() => {
       cancelCurrent()
-      statusStore.clear()
-    }, [props.sessionId])
+      statuses.clear()
+    }, [props.sessionId, props.inputActions])
 
     React.useEffect(() => {
       const store = props.sessions && props.sessions.list
@@ -180,12 +197,19 @@ export function createView(React) {
       })
     }, [props.sessions])
 
-    React.useEffect(() => () => { cancelCurrent() }, [])
+    React.useEffect(() => {
+      mountedRef.current = true
+      return () => { mountedRef.current = false; cancelCurrent() }
+    }, [])
 
     // 让状态提示跟随 composer 输入框：动态定位到输入框上方
     React.useLayoutEffect(() => {
+      const cardForOwner = () => {
+        const owner = ownerRef.current
+        return owner && typeof owner.closest === 'function' ? owner.closest('[data-composer-card]') : undefined
+      }
       const position = () => {
-        const card = document.querySelector('[data-composer-card]')
+        const card = cardForOwner()
         if (card instanceof HTMLElement) {
           const rect = card.getBoundingClientRect()
           setStatusBottom(Math.max(8, window.innerHeight - rect.top + 8))
@@ -193,7 +217,7 @@ export function createView(React) {
         }
       }
       let observer
-      const card = document.querySelector('[data-composer-card]')
+      const card = cardForOwner()
       if (card instanceof HTMLElement && typeof ResizeObserver !== 'undefined') {
         observer = new ResizeObserver(position)
         observer.observe(card)
@@ -277,12 +301,14 @@ export function createView(React) {
         mode,
         modeRevision: revision,
         signal: handle.controller.signal,
+        statusStore: statuses,
         release: () => {
           handle.release()
           if (operationHandleRef.current === handle) operationHandleRef.current = null
         },
         getDraft: () => optsRef.current.draft || '',
-        isActive: () => operationRef.current === id
+        isActive: () => mountedRef.current
+          && operationRef.current === id
           && !handle.controller.signal.aborted
           && optsRef.current.sessionId === started.sessionId
           && optsRef.current.inputActions === started.inputActions
@@ -306,62 +332,79 @@ export function createView(React) {
     async function handleDrop(e) {
       if (busyRef.current) return
       busyRef.current = true
+      const preflightId = ++operationRef.current
       const dataTransfer = e.dataTransfer
-      const files = Array.from((dataTransfer && dataTransfer.files) || [])
+      const fallbackFiles = Array.from((dataTransfer && dataTransfer.files) || [])
       const started = { ...optsRef.current }
-      const modeStatus = statusStore.begin('正在确认拖拽模式…')
-      let directories
+      const modeStatus = statuses.begin('正在确认拖拽模式…')
+      let dropped
       try {
-        directories = await getDirectoryEntries(dataTransfer && dataTransfer.items)
+        dropped = await getDroppedEntries(dataTransfer && dataTransfer.items)
       } catch {
-        busyRef.current = false
-        statusStore.finish(modeStatus, '✗ 未获取到可处理的文件或目录')
+        if (mountedRef.current && operationRef.current === preflightId) {
+          busyRef.current = false
+          statuses.finish(modeStatus, '✗ 未获取到可处理的文件或目录')
+        }
         return
       }
+      if (!mountedRef.current || operationRef.current !== preflightId) return
+      if (dropped.failed || dropped.overflow) {
+        busyRef.current = false
+        statuses.finish(modeStatus, dropped.overflow
+          ? '✗ 一次拖拽的文件和目录总数过多'
+          : '✗ 部分文件或目录无法读取，未处理任何内容')
+        return
+      }
+      const directories = dropped.directories
+      const files = dropped.handled ? dropped.files : fallbackFiles
       let mode
       try { mode = await refreshModeForAction() } catch {
-        busyRef.current = false
-        statusStore.finish(modeStatus, '✗ ' + MODE_READ_ERROR_MESSAGE)
+        if (mountedRef.current && operationRef.current === preflightId) {
+          busyRef.current = false
+          statuses.finish(modeStatus, '✗ ' + MODE_READ_ERROR_MESSAGE)
+        }
         return
       }
-      statusStore.cancel(modeStatus)
-      if (optsRef.current.sessionId !== started.sessionId
+      if (!mountedRef.current || operationRef.current !== preflightId
+        || optsRef.current.sessionId !== started.sessionId
         || optsRef.current.inputActions !== started.inputActions
-        || !currentSessionMatches(props.sessions, started.sessionId)) {
-        busyRef.current = false
-        return
-      }
+        || !currentSessionMatches(props.sessions, started.sessionId)) return
+      statuses.cancel(modeStatus)
       busyRef.current = false
       const action = chooseDropAction(mode, {
         directoryCount: directories.length,
         fileCount: files.length,
       })
 
-      if (action.type.endsWith('-directories')) {
-        if (directories.length > MAX_ROOT_DIRECTORIES) {
-          statusStore.show('✗ 一次最多处理 ' + MAX_ROOT_DIRECTORIES + ' 个目录')
-          return
-        }
-        const locate = action.type === 'locate-directories'
-        await runDropOperation(async (operation) => {
+      if (directories.length > MAX_ROOT_DIRECTORIES) {
+        statuses.show('✗ 一次最多处理 ' + MAX_ROOT_DIRECTORIES + ' 个目录')
+        return
+      }
+      if (files.length > MAX_TOP_LEVEL_FILES) {
+        statuses.show('✗ 一次最多处理 ' + MAX_TOP_LEVEL_FILES + ' 个文件')
+        return
+      }
+      if (action.type === 'none') {
+        statuses.show('✗ 未获取到可处理的文件或目录')
+        return
+      }
+
+      const locate = action.type.startsWith('locate-')
+      const handlesDirectories = action.type.endsWith('-directories') || action.type.endsWith('-mixed')
+      const handlesFiles = action.type.endsWith('-files') || action.type.endsWith('-mixed')
+      await runDropOperation(async (operation) => {
+        if (handlesDirectories) {
           for (const directory of directories) {
-            if (!operation.isActive()) break
+            if (!operation.isActive()) return
             await (locate
               ? processDirectoryLocate(directory, operation)
               : processDirectoryUpload(directory, operation))
           }
-        })
-        return
-      }
-
-      if (action.type.endsWith('-files')) {
-        await runDropOperation((operation) => action.type === 'locate-files'
-          ? processFilesLocate(files, operation)
-          : processFilesUpload(files, operation))
-        return
-      }
-
-      statusStore.show('✗ 未获取到可处理的文件或目录')
+        }
+        if (handlesFiles && operation.isActive()) {
+          await (locate ? processFilesLocate(files, operation) : processFilesUpload(files, operation))
+        }
+      })
     }
 
     return React.createElement(React.Fragment, null,
@@ -392,18 +435,23 @@ export function createView(React) {
     const [clearing, setClearing] = React.useState(false)
     const [clearMsg, setClearMsg] = React.useState('')
     const [usage, setUsage] = React.useState(null)
+    const mountedRef = React.useRef(true)
     React.useEffect(() => {
       let active = true
-      const revision = modeRevision
-      refreshSettings().then((settings) => {
-        if (!active || revision !== modeRevision) return
-        adoptSettings(settings)
+      const applySettings = (settings) => {
+        if (!active) return
         setMode(settings.mode)
         setQuotaMiB(String(settings.uploadQuotaMiB))
         setQuotaEntries(String(settings.uploadQuotaEntries))
         setSavedQuota({ mib: settings.uploadQuotaMiB, entries: settings.uploadQuotaEntries })
+      }
+      const unsubscribe = subscribeSettings(applySettings)
+      refreshSettings().then((settings) => {
+        if (!active) return
+        adoptSettings(settings)
+        applySettings(settings)
       })
-      return () => { active = false }
+      return () => { active = false; unsubscribe() }
     }, [])
     const pick = (nextMode) => {
       beginModeChange(nextMode)
@@ -416,7 +464,6 @@ export function createView(React) {
         setModeMsg('✗ ' + String((error && error.message) || error))
       })
     }
-    const mountedRef = React.useRef(true)
     const sizeRequestRef = React.useRef(0)
     const cleanupRef = React.useRef({ generation: 0, controller: undefined })
     const cancelCleanup = () => {
@@ -424,7 +471,10 @@ export function createView(React) {
       if (cleanupRef.current.controller) cleanupRef.current.controller.abort()
       cleanupRef.current.controller = undefined
     }
-    React.useEffect(() => () => { mountedRef.current = false; cancelCleanup() }, [])
+    React.useEffect(() => {
+      mountedRef.current = true
+      return () => { mountedRef.current = false; cancelCleanup() }
+    }, [])
     // 拉取用户目录 ~/.dsh/.dsh-drops 的实际磁盘占用。
     const loadSize = async (generation, signal) => {
       const requestId = ++sizeRequestRef.current
@@ -589,6 +639,7 @@ export function createView(React) {
         React.createElement('input', { type: 'radio', name: 'dsh-file-drop-mode', checked: mode === 'locate', onChange: () => pick('locate') }),
         React.createElement('span', null, '定位模式（只定位，不复制）')
       ),
+      mode === 'locate' ? React.createElement(SearchRootSettings) : null,
       modeMsg ? React.createElement('div', { className: 'dsh-mode-msg' }, modeMsg) : null
     )
   }
@@ -603,11 +654,22 @@ export function createView(React) {
     .dsh-quota-input-wrap input { width: 100%; min-width: 0; height: 100%; padding: 0 8px; border: 0; outline: 0; background: transparent; color: var(--dsw-alias-label-primary, inherit); font: inherit; }
     .dsh-quota-input-wrap span { padding: 0 8px; white-space: nowrap; color: var(--dsw-alias-label-secondary, rgba(255,255,255,0.58)); }
     .dsh-usage-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
-    .dsh-mode-msg, .dsh-quota-msg, .dsh-clear-msg, .dsh-quota-warning { overflow-wrap: anywhere; }
+    .dsh-external-root-settings { display: flex; flex-direction: column; gap: 8px; padding-left: 24px; min-width: 0; }
+    .dsh-external-root-title { font-size: 12px; color: var(--dsw-alias-label-secondary, rgba(255,255,255,0.68)); }
+    .dsh-external-root-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; min-width: 0; }
+    .dsh-external-root-row input { min-width: 0; height: 28px; padding: 0 8px; border: 1px solid var(--dsw-alias-border-l2-darkmode-thin, rgba(255,255,255,0.15)); border-radius: 6px; outline: 0; background: var(--dsw-alias-bg-input, rgba(128,128,128,0.08)); color: var(--dsw-alias-label-primary, inherit); font: inherit; }
+    .dsh-external-root-row input:focus { border-color: var(--dsw-alias-interactive-primary, #4f8cff); }
+    .dsh-external-root-list { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+    .dsh-external-root-item { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .dsh-external-root-path { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 12px; line-height: 1.4; color: var(--dsw-alias-label-secondary, rgba(255,255,255,0.6)); }
+    .dsh-external-root-state { flex: none; font-size: 12px; color: var(--dsw-alias-label-error, #d92d20); }
+    .dsh-external-root-empty { font-size: 12px; line-height: 1.4; color: var(--dsw-alias-label-secondary, rgba(255,255,255,0.6)); }
+    .dsh-mode-msg, .dsh-quota-msg, .dsh-clear-msg, .dsh-quota-warning, .dsh-external-root-msg { overflow-wrap: anywhere; }
+
     .dsh-mode-msg { padding-left: 24px; font-size: 12px; color: var(--dsw-alias-label-error, #d92d20); }
     .dsh-quota-msg, .dsh-clear-msg { font-size: 12px; line-height: 1.4; color: var(--dsw-alias-label-secondary, rgba(255,255,255,0.6)); }
     .dsh-quota-warning { font-size: 12px; line-height: 1.4; color: var(--dsw-alias-label-error, #d92d20); }
-    @media (max-width: 640px) { .dsh-quota-row { grid-template-columns: minmax(0, 1fr); align-items: stretch; } }
+    @media (max-width: 640px) { .dsh-quota-row, .dsh-external-root-row { grid-template-columns: minmax(0, 1fr); align-items: stretch; } }
     .dsh-clear-btn {
       display: inline-flex; align-items: center; gap: 6px;
       height: 28px; padding: 0 12px;

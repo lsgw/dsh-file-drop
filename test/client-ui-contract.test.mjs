@@ -11,10 +11,10 @@ const plugin = definition.factory((name) => {
 })
 
 test('current UI CSS and component surface stay frozen', () => {
-  assert.equal(plugin.__test.CSS.length, 5961)
+  assert.equal(plugin.__test.CSS.length, 7412)
   assert.equal(
     createHash('sha256').update(plugin.__test.CSS).digest('hex'),
-    'b0c0e01e5c0caf1c59de201a7ea563b608c8087bdb847d7d744ae6a7dd3e7723'
+    'd47f405a2fa175bd748a1a26309379530a2fdf427ff906e614542be5123d5161'
   )
   assert.deepEqual(Object.keys(plugin.__test.components), [
     'DropZone', 'PaperclipButton', 'SettingsSection',

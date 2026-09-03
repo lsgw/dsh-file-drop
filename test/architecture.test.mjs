@@ -8,9 +8,10 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)))
 const source = (...parts) => readFile(join(root, 'src', ...parts), 'utf8')
 
 test('client source keeps the view-runtime-strategy-api dependency direction', async () => {
-  const [index, view, runtime, api, upload, locate, contract] = await Promise.all([
+  const [index, view, searchRootView, runtime, api, upload, locate, contract] = await Promise.all([
     source('client', 'index.js'),
     source('client', 'view.js'),
+    source('client', 'search-root-view.js'),
     source('client', 'runtime.js'),
     source('client', 'api.js'),
     source('client', 'upload-strategy.js'),
@@ -23,8 +24,11 @@ test('client source keeps the view-runtime-strategy-api dependency direction', a
   assert.doesNotMatch(index, /processFilesUpload|fileSampleFingerprint|uploadChunked/)
   assert.match(view, /from '\.\/runtime\.js'/)
   assert.doesNotMatch(view, /from '\.\/(?:api|upload-strategy|locate-strategy)\.js'/)
+  assert.match(searchRootView, /requestRef/)
+  assert.doesNotMatch(searchRootView, /setRoots\(result\.roots\)/)
   assert.match(runtime, /from '\.\/upload-strategy\.js'/)
   assert.match(runtime, /from '\.\/locate-strategy\.js'/)
+  assert.match(runtime, /from '\.\/search-roots\.js'/)
   assert.doesNotMatch(upload, /locateRequest|fileSampleFingerprint|FILE_DROP_ROUTE/)
   assert.doesNotMatch(locate, /uploadChunked|UPLOAD_PATH|FormData/)
   assert.doesNotMatch(contract, /node:|window|document|React/)
@@ -35,6 +39,10 @@ test('client source modules stay bounded and generated bundle stays singular', a
     ['index.js', 90],
     ['runtime.js', 90],
     ['api.js', 310],
+    ['chunk-request.js', 45],
+    ['drop-data.js', 180],
+    ['search-roots.js', 130],
+    ['search-root-view.js', 140],
     ['upload-strategy.js', 130],
     ['locate-strategy.js', 500],
     ['view.js', 850],
@@ -50,16 +58,18 @@ test('client source modules stay bounded and generated bundle stays singular', a
 
 
 test('client core uses standard file and directory capabilities only', async () => {
-  const [dropData, view, runtime, controller] = await Promise.all([
+  const [dropData, view, runtime, controller, searchRoots] = await Promise.all([
     source('client', 'drop-data.js'),
     source('client', 'view.js'),
     source('client', 'runtime.js'),
     source('client', 'drop-controller.js'),
+    source('client', 'search-roots.js'),
   ])
-  for (const [name, text] of [['drop-data.js', dropData], ['view.js', view], ['runtime.js', runtime], ['drop-controller.js', controller]]) {
+  for (const [name, text] of [['drop-data.js', dropData], ['view.js', view], ['runtime.js', runtime], ['drop-controller.js', controller], ['search-roots.js', searchRoots]]) {
     assert.doesNotMatch(text, /dshDesktop|fileUriToPath|extractPaths|drainShellPaths|shellPathOf|webkitGetAsEntry|insert-paths/, name)
   }
   assert.match(dropData, /getAsFileSystemHandle/)
+  assert.match(searchRoots, /BroadcastChannel/)
 })
 
 test('client build uses a standards-based browser target', async () => {
@@ -93,13 +103,16 @@ test('locate core uses generic Node filesystem scanning without platform adapter
 })
 
 test('Host keeps a thin public entry, HTTP shell, and split safety layers', async () => {
-  const [entry, host, http, safety, manifest, storage, settings, upload, protocol] = await Promise.all([
+  const [entry, host, http, localRequest, safety, manifest, storage, gate, searchInspect, settings, upload, protocol] = await Promise.all([
     readFile(join(root, 'index.js'), 'utf8'),
     source('host', 'index.js'),
     source('host', 'http.js'),
+    source('host', 'local-request.js'),
     source('host', 'safety.js'),
     source('host', 'manifest.js'),
     source('host', 'storage.js'),
+    source('host', 'gate.js'),
+    source('host', 'search-root-inspect.js'),
     source('host', 'settings.js'),
     source('host', 'upload-manager.js'),
     source('locate', 'protocol.js'),
@@ -107,6 +120,8 @@ test('Host keeps a thin public entry, HTTP shell, and split safety layers', asyn
 
   assert.match(entry, /^export \{ .* \} from '\.\/src\/host\/index\.js'\s*$/)
   assert.match(host, /from '\.\/http\.js'/)
+  assert.match(http, /from '\.\/local-request\.js'/)
+  assert.match(localRequest, /remoteAddress/)
   assert.doesNotMatch(host, /function (?:sendJson|sendError|requireJson|requireBinary|sameOriginRequest)/)
   assert.match(safety, /export \* from '\.\/manifest\.js'/)
   assert.match(safety, /export \* from '\.\/storage\.js'/)
@@ -116,9 +131,23 @@ test('Host keeps a thin public entry, HTTP shell, and split safety layers', asyn
 
   for (const [name, text, limit] of [
     ['host/index.js', host, 220], ['host/http.js', http, 70],
+    ['host/local-request.js', localRequest, 50],
     ['host/safety.js', safety, 8], ['host/manifest.js', manifest, 260],
-    ['host/storage.js', storage, 600], ['host/upload-manager.js', upload, 410],
+    ['host/storage.js', storage, 600], ['host/gate.js', gate, 50],
+    ['host/search-root-inspect.js', searchInspect, 150], ['host/upload-manager.js', upload, 410],
   ]) assert.ok(text.split(/\r?\n/).length <= limit, name + ' exceeded ' + limit + ' lines')
+})
+
+test('external search roots stay host-validated and platform-neutral', async () => {
+  const [store, inspect] = await Promise.all([
+    source('host', 'search-roots.js'), source('host', 'search-root-inspect.js'),
+  ])
+  assert.match(inspect, /realpath/)
+  assert.match(inspect, /lstat/)
+  assert.match(inspect, /MAX_ACTIVE_INSPECTIONS/)
+  assert.match(store, /registerSearchRootRoute/)
+  assert.doesNotMatch(store + inspect, /process\.platform|powershell|Everything|mdfind|plocate/)
+  assert.ok(store.split(/\r?\n/).length <= 300, 'host/search-roots.js exceeded 300 lines')
 })
 
 test('npm package contains only runtime, source, metadata, and documentation', async () => {

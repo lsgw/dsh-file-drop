@@ -95,7 +95,7 @@ export async function nodeDirectoryContentDigestLocal(root, paths, options = {})
     const absolutePath = join(root, ...safePath.split('/'))
     const info = await beforeDeadline(lstat(absolutePath), budget)
     if (info.isSymbolicLink() || !info.isFile()) continue
-    const digest = await beforeDeadline(sampleFingerprint(absolutePath, info.size), budget)
+    const digest = await beforeDeadline(sampleFingerprint(absolutePath, info.size, info), budget)
     samples.push({ path, size: info.size, digest })
   }
   return directoryContentDigest(samples)

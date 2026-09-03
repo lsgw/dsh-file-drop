@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { LOCATE_PROTOCOL_VERSION as PROTOCOL_VERSION } from '../shared/contract.js'
+import { LOCATE_PROTOCOL_VERSION as PROTOCOL_VERSION, MAX_EXTERNAL_SEARCH_ROOTS } from '../shared/contract.js'
 import { locate } from './locator.js'
 import { HttpError, resolveBaseDir, sessionCwd } from '../host/safety.js'
 import { physicalPathKey } from '../shared/node-path.js'
@@ -66,31 +66,86 @@ function sameStringArray(left, right) {
     && left.every((value, index) => value === right[index])
 }
 
+function excludedPathList(value) {
+  const paths = []
+  let bytes = 0
+  for (const path of (Array.isArray(value) ? value : [])) {
+    if (typeof path !== 'string' || path === '' || path.length > 32768 || path.includes('\0')) continue
+    const pathBytes = Buffer.byteLength(path, 'utf8')
+    if (paths.length >= 64 || bytes + pathBytes > 64 * 1024) break
+    paths.push(path)
+    bytes += pathBytes
+  }
+  return paths
+}
+
 async function workspaceKey(value) {
   if (typeof value !== 'string' || value === '') return ''
   return physicalPathKey(value)
 }
 
-async function trustedWorkspaceRoots(ctx, currentWorkspacePath, excludedPaths) {
+function compareScope(left, right) {
+  const a = JSON.stringify(left)
+  const b = JSON.stringify(right)
+  return a < b ? -1 : a > b ? 1 : 0
+}
+
+function validExternalState(value) {
+  return value && Number.isSafeInteger(value.epoch) && value.epoch >= 0
+    && Array.isArray(value.roots)
+}
+
+async function trustedWorkspaceRoots(ctx, currentWorkspacePath, excludedPaths, getExternalSearchRoots, includeSessionRoots) {
   const excluded = new Set()
-  for (const value of (Array.isArray(excludedPaths) ? excludedPaths : []).slice(0, 64)) {
+  for (const value of excludedPathList(excludedPaths)) {
     const key = await workspaceKey(value)
     if (key) excluded.add(key)
   }
   const roots = []
   const seen = new Set()
-  const add = async (value) => {
+  const scopeEntries = []
+  const add = async (value, descriptor) => {
+    if (roots.length >= 64) return
     const key = await workspaceKey(value)
-    if (!key || seen.has(key) || excluded.has(key) || roots.length >= 64) return
+    if (!key || seen.has(key) || excluded.has(key)) return
     seen.add(key)
     roots.push(value)
+    scopeEntries.push([...descriptor, key])
   }
-  await add(currentWorkspacePath)
-  try {
-    const sessions = ctx.sessions && typeof ctx.sessions.list === 'function' ? ctx.sessions.list() : []
-    for (const session of sessions) await add(sessionCwd(session))
-  } catch {}
-  return roots
+  await add(currentWorkspacePath, ['workspace'])
+
+  let externalState = { epoch: 0, roots: [] }
+  if (getExternalSearchRoots) {
+    try {
+      externalState = await getExternalSearchRoots() || externalState
+      if (!validExternalState(externalState)) externalState = { epoch: 'unavailable', roots: [] }
+    } catch {
+      externalState = { epoch: 'unavailable', roots: [] }
+    }
+    const externalRoots = externalState.roots.slice(0, MAX_EXTERNAL_SEARCH_ROOTS)
+    for (const root of externalRoots) {
+      if (!root || typeof root.path !== 'string' || typeof root.id !== 'string'
+        || typeof root.generation !== 'string' || typeof root.identity !== 'string') continue
+      await add(root.path, ['external', root.id, root.generation, root.identity])
+    }
+  }
+
+  if (includeSessionRoots) {
+    try {
+      const sessions = ctx.sessions && typeof ctx.sessions.list === 'function' ? ctx.sessions.list() : []
+      for (const session of sessions) {
+        if (roots.length >= 64) break
+        await add(sessionCwd(session), ['workspace'])
+      }
+    } catch {}
+  }
+  scopeEntries.sort(compareScope)
+  const currentKey = await workspaceKey(currentWorkspacePath)
+  return {
+    paths: roots,
+    currentTrusted: Boolean(currentKey && seen.has(currentKey) && !excluded.has(currentKey)),
+    scope: digestJson([externalState.epoch, scopeEntries]),
+  }
 }
 export function createSecureLocator(ctx, options = {}) {
   const ttlMs = options.ttlMs || CHALLENGE_TTL_MS
@@ -103,10 +158,13 @@ export function createSecureLocator(ctx, options = {}) {
   const maxConcurrentLocates = options.maxConcurrentLocates || MAX_CONCURRENT_LOCATES
   const maxConcurrentLocatesPerSession = options.maxConcurrentLocatesPerSession || MAX_CONCURRENT_LOCATES_PER_SESSION
   const locateFn = options.locateFn || locate
+  const getExternalSearchRoots = options.getExternalSearchRoots
   const resolveBaseDirFn = options.resolveBaseDirFn || resolveBaseDir
   const now = options.now || Date.now
   const tokenFactory = options.tokenFactory || randomUUID
   const challenges = new Map()
+  const readTrustedRoots = (currentWorkspacePath, excludedPaths, includeSessionRoots) =>
+    trustedWorkspaceRoots(ctx, currentWorkspacePath, excludedPaths, getExternalSearchRoots, includeSessionRoots)
   const locateCounts = new Map()
   let totalBytes = 0
   let concurrentLocates = 0
@@ -186,7 +244,7 @@ export function createSecureLocator(ctx, options = {}) {
     throw new HttpError(429, 'locate challenge capacity exceeded')
   }
 
-  const issue = (request, result, phase, replaceToken, workspaceScope) => {
+  const issue = (request, result, phase, replaceToken, workspaceScope, rootScope, excludedWorkspacePaths) => {
     const key = requestSessionKey(request)
     const candidates = Array.isArray(result.candidates) ? [...result.candidates] : []
     const paths = Array.isArray(result.paths) ? [...result.paths] : undefined
@@ -200,6 +258,8 @@ export function createSecureLocator(ctx, options = {}) {
       structureIdentity,
       candidates,
       paths,
+      rootScope,
+      excludedWorkspacePaths,
     ]) + 256
     const replaceWithoutReplay = ensureCapacity(key, replaceToken, recordBytes)
     let token
@@ -221,6 +281,8 @@ export function createSecureLocator(ctx, options = {}) {
       candidates,
       paths,
       workspaceScope,
+      rootScope,
+      excludedWorkspacePaths: excludedPathList(excludedWorkspacePaths),
       expiresAt: now() + ttlMs,
       completed: false,
       bytes: recordBytes,
@@ -229,11 +291,12 @@ export function createSecureLocator(ctx, options = {}) {
     return { ...result, challenge: token }
   }
 
-  const continuationKey = (request) => digestJson([
+  const continuationKey = (request, rootScope) => digestJson([
     request.phase,
     requestSessionKey(request),
     fileIdentity(request.file),
     request.digest || null,
+    rootScope,
     directoryStructureIdentity(request.file) || null,
     Array.isArray(request.directorySamples)
       ? digestJson(request.directorySamples.map((sample) => [sample && sample.path, sample && sample.size, sample && sample.digest]))
@@ -241,28 +304,61 @@ export function createSecureLocator(ctx, options = {}) {
   ])
 
   const secureMetadata = async (request) => {
-    let currentWorkspacePath
+    if (Object.hasOwn(request, 'excludedWorkspacePaths') || Object.hasOwn(request, 'excludedCandidates')) {
+      throw new HttpError(400, 'raw locate path exclusions are not accepted')
+    }
+    if (Object.hasOwn(request, 'excludeCurrentWorkspace') && request.excludeCurrentWorkspace !== true) {
+      throw new HttpError(400, 'invalid current-workspace exclusion')
+    }
     const hasSession = Object.hasOwn(request, 'sessionId')
-    if (hasSession) currentWorkspacePath = await resolveBaseDirFn(ctx, request.sessionId, true)
+    const currentWorkspacePath = hasSession ? await resolveBaseDirFn(ctx, request.sessionId, true) : undefined
+    const excludeCurrent = request.excludeCurrentWorkspace === true && currentWorkspacePath !== undefined
     const key = requestSessionKey(request)
     prune()
+    let retry
+    if (Object.hasOwn(request, 'retryChallenge')) {
+      if (typeof request.retryChallenge !== 'string' || request.retryChallenge === '') {
+        throw new HttpError(400, 'invalid locate retry challenge')
+      }
+      retry = challenges.get(request.retryChallenge)
+      if (!retry || retry.expiresAt <= now()) throw new HttpError(410, 'locate retry challenge expired')
+      if (retry.sessionId !== key) throw new HttpError(403, 'locate retry session mismatch')
+      if (retry.fileIdentity !== fileIdentity(request.file)) throw new HttpError(409, 'locate retry metadata changed')
+      if (!retry.completed || retry.result?.status !== 'not-found'
+        || retry.excludedWorkspacePaths.length !== 0) {
+        throw new HttpError(409, 'locate retry challenge is not eligible')
+      }
+    }
+    if (excludeCurrent && !retry) throw new HttpError(400, 'current workspace exclusion requires a retry challenge')
+    const baseline = retry ? await readTrustedRoots(currentWorkspacePath, [], hasSession) : undefined
+    if (retry) {
+      if (retry.workspaceScope !== await workspaceKey(currentWorkspacePath)
+        || retry.rootScope !== baseline.scope) {
+        throw new HttpError(409, 'locate retry search roots changed')
+      }
+    }
     if (activeCount(key) >= maxChallengesPerSession) {
       throw new HttpError(429, 'too many active locate challenges for this session')
     }
-    const workspacePaths = await trustedWorkspaceRoots(ctx, currentWorkspacePath, request.excludedWorkspacePaths)
-    const currentKey = await workspaceKey(currentWorkspacePath)
-    let currentTrusted = false
-    for (const path of workspacePaths) {
-      if (await workspaceKey(path) === currentKey) { currentTrusted = true; break }
-    }
+    const excludedPaths = excludeCurrent ? [currentWorkspacePath] : []
+    const excludedCandidates = retry ? [...retry.candidates] : []
+    const trusted = excludeCurrent
+      ? await readTrustedRoots(currentWorkspacePath, excludedPaths, hasSession)
+      : baseline || await readTrustedRoots(currentWorkspacePath, excludedPaths, hasSession)
     const trustedRequest = {
-      ...request,
-      workspacePaths,
-      currentWorkspacePath: currentTrusted ? currentWorkspacePath : undefined,
+      phase: 'metadata',
+      file: request.file,
+      workspacePaths: trusted.paths,
+      currentWorkspacePath: trusted.currentTrusted ? currentWorkspacePath : undefined,
+      excludedCandidates,
     }
     const result = await runLocate(request, () => locateFn(trustedRequest))
+    const afterWorkspacePath = hasSession ? await resolveBaseDirFn(ctx, request.sessionId, true) : undefined
+    const after = await readTrustedRoots(afterWorkspacePath, excludedPaths, hasSession)
+    if (after.scope !== trusted.scope) throw new HttpError(409, 'locate search roots changed')
+    const afterKey = await workspaceKey(afterWorkspacePath)
     const phase = nextPhase(result)
-    return phase ? issue(request, result, phase, undefined, currentKey) : result
+    return phase ? issue(request, result, phase, undefined, afterKey, after.scope, excludedPaths) : result
   }
 
   const retainReplay = (token, record, result) => {
@@ -290,12 +386,14 @@ export function createSecureLocator(ctx, options = {}) {
     const sessionKey = requestSessionKey(request)
     if (record.sessionId !== sessionKey) throw new HttpError(403, 'locate session mismatch')
     if (record.fileIdentity !== fileIdentity(request.file)) throw new HttpError(409, 'dropped-file metadata changed')
-    if (sessionKey !== 'global') {
-      const currentWorkspacePath = await resolveBaseDirFn(ctx, request.sessionId, true)
-      if (await workspaceKey(currentWorkspacePath) !== record.workspaceScope) {
-        throw new HttpError(409, 'locate session workspace changed')
-      }
+    const hasSession = sessionKey !== 'global'
+    const currentWorkspacePath = hasSession
+      ? await resolveBaseDirFn(ctx, request.sessionId, true) : undefined
+    if (hasSession && await workspaceKey(currentWorkspacePath) !== record.workspaceScope) {
+      throw new HttpError(409, 'locate session workspace changed')
     }
+    const trusted = await readTrustedRoots(currentWorkspacePath, record.excludedWorkspacePaths, hasSession)
+    if (trusted.scope !== record.rootScope) throw new HttpError(409, 'locate search roots changed')
     if (record.directoryStructureIdentity !== undefined
       && record.directoryStructureIdentity !== directoryStructureIdentity(request.file)) {
       throw new HttpError(409, 'directory structure changed')
@@ -306,7 +404,7 @@ export function createSecureLocator(ctx, options = {}) {
         : undefined
       if (!sameStringArray(samplePaths, record.paths)) throw new HttpError(409, 'directory sample set changed')
     }
-    const key = continuationKey(request)
+    const key = continuationKey(request, record.rootScope)
     if (record.completed) {
       if (record.requestKey !== key) throw new HttpError(409, 'locate challenge was already completed by another request')
       return record.result
@@ -318,8 +416,20 @@ export function createSecureLocator(ctx, options = {}) {
 
     record.requestKey = key
     const operation = (async () => {
-      const trustedRequest = { ...request, candidates: record.candidates }
+      const trustedRequest = {
+        ...request,
+        candidates: record.candidates,
+        workspacePaths: trusted.paths,
+        currentWorkspacePath: trusted.currentTrusted ? currentWorkspacePath : undefined,
+      }
       const rawResult = await runLocate(request, () => locateFn(trustedRequest))
+      const afterWorkspacePath = hasSession
+        ? await resolveBaseDirFn(ctx, request.sessionId, true) : undefined
+      if (hasSession && await workspaceKey(afterWorkspacePath) !== record.workspaceScope) {
+        throw new HttpError(409, 'locate session workspace changed')
+      }
+      const after = await readTrustedRoots(afterWorkspacePath, record.excludedWorkspacePaths, hasSession)
+      if (after.scope !== record.rootScope) throw new HttpError(409, 'locate search roots changed')
       if (rawResult && rawResult.status === 'error') {
         record.inFlight = undefined
         record.requestKey = undefined
@@ -327,8 +437,10 @@ export function createSecureLocator(ctx, options = {}) {
       }
       const phase = nextPhase(rawResult)
       const result = phase
-        ? issue(request, rawResult, phase, request.challenge, record.workspaceScope)
-        : rawResult
+        ? issue(request, rawResult, phase, request.challenge, record.workspaceScope, after.scope, record.excludedWorkspacePaths)
+        : rawResult?.status === 'not-found'
+          ? { ...rawResult, retryChallenge: request.challenge }
+          : rawResult
       record.inFlight = undefined
       retainReplay(request.challenge, record, result)
       return result
@@ -347,7 +459,6 @@ export function createSecureLocator(ctx, options = {}) {
     if (!request || request.protocolVersion !== PROTOCOL_VERSION) {
       throw new HttpError(426, 'locate protocol v2 is required; refresh the page')
     }
-    if (request.phase === 'metadata') return secureMetadata(request)
-    return secureContinuation(request)
+    return request.phase === 'metadata' ? secureMetadata(request) : secureContinuation(request)
   }
 }

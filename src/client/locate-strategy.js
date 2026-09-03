@@ -1,6 +1,7 @@
 import {
   FILE_DROP_ROUTE as LOCATE_ROUTE, LOCATE_FULL_MAX_BYTES, LOCATE_MAX_DEPTH,
-  LOCATE_MAX_ENTRIES, LOCATE_PROTOCOL_VERSION, LOCATE_SAMPLE_BYTES, MAX_TOP_LEVEL_FILES,
+  LOCATE_MAX_ENTRIES, LOCATE_MAX_STRUCTURE_BYTES, LOCATE_PROTOCOL_VERSION, LOCATE_SAMPLE_BYTES,
+  MAX_TOP_LEVEL_FILES,
 } from '../shared/contract.js'
 import { throwIfAborted } from './api.js'
 import { abortableCallback } from './drop-data.js'
@@ -76,9 +77,18 @@ async function readEntryChildren(entry, signal) {
   }
 }
 
-async function readDirectoryStructure(root, signal) {
+async function readDirectoryStructure(root, signal, maxBytes = LOCATE_MAX_STRUCTURE_BYTES) {
   const entries = []
+  const encoder = new TextEncoder()
+  let encodedBytes = 2
   let truncated = false
+  const append = (entry) => {
+    const bytes = encoder.encode(JSON.stringify(entry)).byteLength + (entries.length > 0 ? 1 : 0)
+    if (encodedBytes + bytes > maxBytes) { truncated = true; return false }
+    entries.push(entry)
+    encodedBytes += bytes
+    return true
+  }
   const visit = async (directory, prefix, depth) => {
     throwIfAborted(signal)
     if (depth >= LOCATE_MAX_DEPTH) { truncated = true; return }
@@ -89,11 +99,11 @@ async function readDirectoryStructure(root, signal) {
       if (entries.length >= LOCATE_MAX_ENTRIES) { truncated = true; return }
       const path = prefix === '' ? child.name : prefix + '/' + child.name
       if (child.isDirectory) {
-        entries.push({ path, kind: 'directory' })
+        if (!append({ path, kind: 'directory' })) return
         await visit(child, path, depth + 1)
       } else if (child.isFile) {
         const file = await abortableCallback(signal, (resolve, reject) => child.file(resolve, reject))
-        entries.push({ path, kind: 'file', size: file.size })
+        if (!append({ path, kind: 'file', size: file.size })) return
       }
     }
   }
@@ -164,13 +174,12 @@ async function locateDroppedFile(file, workspaces, currentWorkspacePath, session
   const wctx = workspaceContext(workspaces, currentWorkspacePath, sessionId)
   const metadata = await locateRequest({ phase: 'metadata', file: meta, ...wctx }, signal)
   let result = await verifyFileCandidates(file, meta, metadata, sessionId, signal)
-  if (result.status !== 'not-found') return result
+  if (result.status !== 'not-found' || !result.retryChallenge) return result
 
   // 排除内容不匹配的候选和当前根，再在可信搜索范围内查找嵌套原件。
   const retryContext = currentWorkspacePath === undefined ? wctx : retryWorkspaceContext(wctx, currentWorkspacePath)
   result = await locateRequest({
-    phase: 'metadata', file: meta, ...retryContext,
-    excludedCandidates: Array.isArray(metadata.candidates) ? metadata.candidates : [],
+    phase: 'metadata', file: meta, ...retryContext, retryChallenge: result.retryChallenge,
   }, signal)
   return verifyFileCandidates(file, meta, result, sessionId, signal)
 }
@@ -201,11 +210,10 @@ async function locateDroppedDirectory(entry, workspaces, currentWorkspacePath, s
   const wctx = workspaceContext(workspaces, currentWorkspacePath, sessionId)
   const metadata = await locateRequest({ phase: 'metadata', file: initial, ...wctx }, signal)
   let result = await verifyDirectoryCandidates(entry, initial, metadata, sessionId, signal)
-  if (result.status !== 'not-found') return result
+  if (result.status !== 'not-found' || !result.retryChallenge) return result
   const retryContext = currentWorkspacePath === undefined ? wctx : retryWorkspaceContext(wctx, currentWorkspacePath)
   result = await locateRequest({
-    phase: 'metadata', file: initial, ...retryContext,
-    excludedCandidates: Array.isArray(metadata.candidates) ? metadata.candidates : [],
+    phase: 'metadata', file: initial, ...retryContext, retryChallenge: result.retryChallenge,
   }, signal)
   return verifyDirectoryCandidates(entry, initial, result, sessionId, signal)
 }
@@ -229,19 +237,20 @@ function choosePathInteractive(name, candidates) {
 }
 
 async function processFilesLocate(files, opts) {
+  const statuses = opts.statusStore || statusStore
   if (files.length > MAX_TOP_LEVEL_FILES) {
-    statusStore.show('✗ 一次最多处理 ' + MAX_TOP_LEVEL_FILES + ' 个文件')
+    statuses.show('✗ 一次最多处理 ' + MAX_TOP_LEVEL_FILES + ' 个文件')
     return
   }
   const { sessionId, inputActions, getDraft, workspaces, currentWorkspacePath, signal } = opts
   const isActive = typeof opts.isActive === 'function' ? opts.isActive : () => true
-  const statusToken = statusStore.begin('正在定位文件中…')
+  const statusToken = statuses.begin('正在定位文件中…')
   const found = []
   const failures = []
   for (const file of files) {
     try {
       const result = await locateDroppedFile(file, workspaces, currentWorkspacePath, sessionId, signal)
-      if (!isActive()) { statusStore.cancel(statusToken); return }
+      if (!isActive()) { statuses.cancel(statusToken); return }
       if (result.status === 'found') found.push(result.path)
       else if (result.status === 'choose') {
         const picked = choosePathInteractive(file.name, result.candidates)
@@ -249,43 +258,44 @@ async function processFilesLocate(files, opts) {
         else failures.push(file.name)
       } else failures.push(file.name)
     } catch (err) {
-      if (!isActive()) { statusStore.cancel(statusToken); return }
+      if (!isActive()) { statuses.cancel(statusToken); return }
       failures.push(file.name)
     }
   }
-  if (!isActive()) { statusStore.cancel(statusToken); return }
+  if (!isActive()) { statuses.cancel(statusToken); return }
   if (found.length > 0) insertPaths(inputActions, getDraft(), found, isActive, opts.ownerElement)
   const summary = [
     found.length > 0 ? '✓ 已定位 ' + found.length + ' 个原始路径' : '',
     failures.length > 0 ? '✗ 未能定位：' + summarizeItems(failures, '、') : '',
   ].filter(Boolean).join('　')
-  statusStore.finish(statusToken, summary || '✗ 没有文件被定位')
+  statuses.finish(statusToken, summary || '✗ 没有文件被定位')
 }
 
 async function processDirectoryLocate(entry, opts) {
+  const statuses = opts.statusStore || statusStore
   const { sessionId, inputActions, getDraft, workspaces, currentWorkspacePath, signal } = opts
   const isActive = typeof opts.isActive === 'function' ? opts.isActive : () => true
-  const statusToken = statusStore.begin('正在定位目录中…')
+  const statusToken = statuses.begin('正在定位目录中…')
   try {
     const result = await locateDroppedDirectory(entry, workspaces, currentWorkspacePath, sessionId, signal)
-    if (!isActive()) { statusStore.cancel(statusToken); return }
+    if (!isActive()) { statuses.cancel(statusToken); return }
     if (result.status === 'found') {
       insertPaths(inputActions, getDraft(), [result.path], isActive, opts.ownerElement)
-      statusStore.finish(statusToken, '✓ 已定位目录原始路径：' + entry.name)
+      statuses.finish(statusToken, '✓ 已定位目录原始路径：' + entry.name)
     } else if (result.status === 'choose') {
       const picked = choosePathInteractive(entry.name, result.candidates)
       if (picked) {
         insertPaths(inputActions, getDraft(), [picked], isActive, opts.ownerElement)
-        statusStore.finish(statusToken, '✓ 已定位目录原始路径：' + entry.name)
+        statuses.finish(statusToken, '✓ 已定位目录原始路径：' + entry.name)
       } else {
-        statusStore.finish(statusToken, '✗ 未选择目录路径')
+        statuses.finish(statusToken, '✗ 未选择目录路径')
       }
     } else {
-      statusStore.finish(statusToken, '✗ 未能定位目录：' + entry.name)
+      statuses.finish(statusToken, '✗ 未能定位目录：' + entry.name)
     }
   } catch (err) {
-    if (!isActive()) { statusStore.cancel(statusToken); return }
-    statusStore.finish(statusToken, '✗ 未能定位目录：' + entry.name)
+    if (!isActive()) { statuses.cancel(statusToken); return }
+    statuses.finish(statusToken, '✗ 未能定位目录：' + entry.name)
   }
 }
 

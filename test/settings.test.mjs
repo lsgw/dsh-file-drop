@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -54,6 +54,8 @@ test('settings store persists atomic patches and fails closed on corrupt disk da
     maxBytes: 12345 * MIB_BYTES,
     maxEntries: 6789,
   })
+  assert.deepEqual(await readdir(join(root, 'nested')), ['settings.json'])
+  if (process.platform !== 'win32') assert.equal((await stat(path)).mode & 0o777, 0o600)
   await writeFile(path, '{', 'utf8')
   assert.throws(() => store.read(), SyntaxError)
   await writeFile(path, JSON.stringify({ mode: 'locate' }), 'utf8')

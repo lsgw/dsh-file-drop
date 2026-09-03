@@ -1,4 +1,5 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { dirname } from 'node:path'
 import {
   DEFAULT_SETTINGS, LOCATE_MODE_ERROR_CODE, LOCATE_MODE_ERROR_MESSAGE,
@@ -68,6 +69,27 @@ export function validateFileDropSettingsPatch(value) {
   return Object.fromEntries(keys.map((key) => [key, value[key]]))
 }
 
+function writeSettingsAtomic(filePath, value) {
+  const directory = dirname(filePath)
+  const temporary = filePath + '.tmp-' + randomUUID()
+  mkdirSync(directory, { recursive: true, mode: 0o700 })
+  let descriptor
+  try {
+    descriptor = openSync(temporary, 'wx', 0o600)
+    writeFileSync(descriptor, value, 'utf8')
+    fsyncSync(descriptor)
+    closeSync(descriptor)
+    descriptor = undefined
+    renameSync(temporary, filePath)
+    try { chmodSync(filePath, 0o600) } catch {}
+  } finally {
+    if (descriptor !== undefined) {
+      try { closeSync(descriptor) } catch {}
+    }
+    try { unlinkSync(temporary) } catch {}
+  }
+}
+
 export function createSettingsStore(filePath) {
   if (typeof filePath !== 'string' || filePath === '') throw new TypeError('settings file path is required')
   const read = () => {
@@ -80,8 +102,7 @@ export function createSettingsStore(filePath) {
   }
   const write = (value) => {
     const settings = validateFileDropSettings(value)
-    mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 })
-    writeFileSync(filePath, JSON.stringify(settings), { encoding: 'utf8', mode: 0o600 })
+    writeSettingsAtomic(filePath, JSON.stringify(settings))
     return settings
   }
   return Object.freeze({

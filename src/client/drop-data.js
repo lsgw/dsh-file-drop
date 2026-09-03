@@ -1,4 +1,4 @@
-import { MAX_ROOT_DIRECTORIES } from '../shared/contract.js'
+import { MAX_ROOT_DIRECTORIES, MAX_TOP_LEVEL_FILES } from '../shared/contract.js'
 import { throwIfAborted } from './api.js'
 
 // ---- 目录遍历（标准 File System Handle） ----
@@ -86,13 +86,12 @@ function fileSystemHandleEntry(handle) {
     }
   }
   if (handle.kind !== 'directory' || typeof handle.values !== 'function') return undefined
-  let iterator
   return {
     name: handle.name,
     isFile: false,
     isDirectory: true,
     createReader() {
-      iterator ||= handle.values()
+      const iterator = handle.values()
       return {
         readEntries(resolve, reject) {
           Promise.resolve().then(async () => {
@@ -111,26 +110,55 @@ function fileSystemHandleEntry(handle) {
   }
 }
 
-async function getDirectoryEntries(items) {
-  const dirs = []
-  if (!items) return dirs
-  for (const item of items) {
+async function getDroppedEntries(items) {
+  if (!items) return { directories: [], files: [], handled: false, failed: false, overflow: false }
+  const limit = MAX_ROOT_DIRECTORIES + MAX_TOP_LEVEL_FILES + 1
+  const candidates = Array.from(items).filter((item) => item && item.kind !== 'string')
+  const records = []
+  for (const item of candidates.slice(0, limit)) {
+    let fallback
+    try { if (typeof item.getAsFile === 'function') fallback = item.getAsFile() || undefined } catch {}
+    let handle
     try {
-      let entry
-      if (typeof item.getAsFileSystemHandle === 'function') {
-        try { entry = fileSystemHandleEntry(await item.getAsFileSystemHandle()) } catch { /* 当前浏览器不支持 */ }
-      }
-
-      if (entry && entry.isDirectory) {
-        dirs.push(entry)
-        if (dirs.length > MAX_ROOT_DIRECTORIES) break
-      }
-    } catch { /* 忽略 */ }
+      handle = typeof item.getAsFileSystemHandle === 'function'
+        ? Promise.resolve(item.getAsFileSystemHandle()) : Promise.resolve(undefined)
+    } catch (error) {
+      handle = Promise.reject(error)
+    }
+    records.push({ handle, fallback })
   }
-  return dirs
+  const directories = []
+  const files = []
+  let failed = false
+  const results = await Promise.allSettled(records.map((record) => record.handle))
+  for (let index = 0; index < results.length; index += 1) {
+    const result = results[index]
+    const fallback = records[index].fallback
+    const entry = result.status === 'fulfilled' ? fileSystemHandleEntry(result.value) : undefined
+    if (entry?.isDirectory) { directories.push(entry); continue }
+    if (entry?.isFile) {
+      try {
+        files.push(await new Promise((resolve, reject) => entry.file(resolve, reject)))
+        continue
+      } catch {}
+    }
+    if (fallback) files.push(fallback)
+    else failed = true
+  }
+  return {
+    directories,
+    files,
+    handled: records.length > 0,
+    failed,
+    overflow: candidates.length > limit,
+  }
+}
+
+async function getDirectoryEntries(items) {
+  return (await getDroppedEntries(items)).directories
 }
 
 
 export {
-  abortableCallback, abortableDelay, getDirectoryEntries, readEntryAll, shouldHandleDataTransfer,
+  abortableCallback, abortableDelay, getDirectoryEntries, getDroppedEntries, readEntryAll, shouldHandleDataTransfer,
 }

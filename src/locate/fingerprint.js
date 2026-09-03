@@ -1,6 +1,6 @@
 // dsh-file-drop / locate engine — sampled & full file fingerprints.
 import { createHash } from 'node:crypto'
-import { open } from 'node:fs/promises'
+import { lstat, open } from 'node:fs/promises'
 import { SAMPLE_BYTES } from './protocol.js'
 
 export function sampleRanges(size) {
@@ -19,24 +19,55 @@ export function hashParts(size, parts) {
   return hash.digest('hex')
 }
 
-export async function sampleFingerprint(path, size) {
+export async function readRange(handle, start, length) {
+  const buffer = Buffer.allocUnsafe(length)
+  let offset = 0
+  while (offset < length) {
+    const { bytesRead } = await handle.read(buffer, offset, length - offset, start + offset)
+    if (bytesRead <= 0) throw new Error('file changed during fingerprint')
+    offset += bytesRead
+  }
+  return buffer
+}
+
+function sameFileIdentity(left, right) {
+  return left.dev && left.ino && right.dev && right.ino
+    ? left.dev === right.dev && left.ino === right.ino
+    : true
+}
+
+async function assertOpenFile(path, handle, size, expectedInfo) {
+  const opened = await handle.stat()
+  const current = await lstat(path)
+  if (!opened.isFile() || !current.isFile() || current.isSymbolicLink()
+    || opened.size !== size || current.size !== size
+    || (expectedInfo && !sameFileIdentity(opened, expectedInfo))
+    || !sameFileIdentity(opened, current)) {
+    throw new Error('file changed during fingerprint')
+  }
+}
+
+export async function sampleFingerprint(path, size, expectedInfo) {
   const handle = await open(path, 'r')
   try {
+    await assertOpenFile(path, handle, size, expectedInfo)
     const parts = []
     for (const range of sampleRanges(size)) {
-      const buffer = Buffer.allocUnsafe(range.length)
-      const { bytesRead } = await handle.read(buffer, 0, range.length, range.start)
-      parts.push(buffer.subarray(0, bytesRead))
+      parts.push(await readRange(handle, range.start, range.length))
     }
+    await assertOpenFile(path, handle, size, expectedInfo)
     return hashParts(size, parts)
   } finally {
     await handle.close()
   }
 }
 
-export async function fullFingerprint(path) {
+export async function fullFingerprint(path, expectedInfo) {
   const handle = await open(path, 'r')
   try {
+    const initial = await handle.stat()
+    const size = expectedInfo ? expectedInfo.size : initial.size
+    await assertOpenFile(path, handle, size, expectedInfo)
     const hash = createHash('sha256')
     const buffer = Buffer.allocUnsafe(256 * 1024)
     let position = 0
@@ -46,6 +77,8 @@ export async function fullFingerprint(path) {
       hash.update(buffer.subarray(0, bytesRead))
       position += bytesRead
     }
+    if (position !== size) throw new Error('file changed during fingerprint')
+    await assertOpenFile(path, handle, size, expectedInfo)
     return hash.digest('hex')
   } finally {
     await handle.close()

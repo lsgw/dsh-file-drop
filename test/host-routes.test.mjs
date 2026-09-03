@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Readable } from 'node:stream'
-import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { sampleFingerprint } from '../src/locate/fingerprint.js'
 import { apply, applyForTest, createPathLock } from '../index.js'
 
 async function fixture(t) {
@@ -55,6 +56,7 @@ async function callRoute(routes, path, options = {}) {
     : options.body === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(options.body))
   const req = Readable.from(options.chunks || [raw])
   req.method = options.method || 'POST'
+  req.socket = { remoteAddress: options.remoteAddress || '127.0.0.1' }
   req.headers = {
     host: '127.0.0.1:3080',
     ...(options.contentType === false ? {} : { 'content-type': options.contentType || 'application/json' }),
@@ -77,10 +79,16 @@ async function callRoute(routes, path, options = {}) {
 }
 
 const UPLOAD_PATH = '/api/dsh-file-drop/upload'
+const SEARCH_ROOTS_PATH = '/api/dsh-file-drop/search-roots'
 const CHUNK_BYTES = 4 * 1024 * 1024
 
+async function enableLocate(routes) {
+  const response = await callRoute(routes, '/api/dsh-file-drop/settings', { body: { mode: 'locate' } })
+  assert.equal(response.status, 200)
+}
+
 async function initUpload(routes, body) {
-  return callRoute(routes, UPLOAD_PATH + '/init', { body })
+  return callRoute(routes, UPLOAD_PATH + '/init', { body: { protocolVersion: 3, ...body } })
 }
 
 async function writeChunk(routes, uploadId, fileIndex, offset, data, options = {}) {
@@ -137,13 +145,231 @@ test('Host upload routes enforce method, origin and content type boundaries', as
   const routes = await createRoutes(root)
   const initPath = UPLOAD_PATH + '/init'
   assert.equal((await callRoute(routes, initPath, { raw: '{' })).status, 400)
+  assert.equal((await callRoute(routes, initPath, {
+    body: { kind: 'file', name: 'old.txt', size: 0 },
+  })).status, 426)
   assert.equal((await callRoute(routes, initPath, { body: {}, contentType: 'text/plain' })).status, 415)
   assert.equal((await callRoute(routes, initPath, { body: {}, origin: 'https://evil.example' })).status, 403)
+  assert.equal((await callRoute(routes, initPath, {
+    body: {}, origin: 'http://evil.example:3080', headers: { host: 'evil.example:3080' },
+  })).status, 403)
+  assert.equal((await callRoute(routes, initPath, {
+    body: {}, origin: null, remoteAddress: '192.0.2.10',
+  })).status, 403)
+  assert.equal((await callRoute(routes, '/api/dsh-file-drop/settings', {
+    method: 'GET', origin: null, contentType: false,
+  })).status, 200)
   assert.equal((await callRoute(routes, initPath, { body: {}, method: 'GET' })).status, 405)
   assert.equal((await callRoute(routes, UPLOAD_PATH + '/chunk', { raw: Buffer.from('x') })).status, 415)
   assert.equal((await callRoute(routes, '/api/dsh-file-drop/settings', { method: 'PUT', body: {} })).status, 405)
   assert.equal(routes.has('/api/dsh-file-drop'), false)
   assert.equal(routes.has('/api/dsh-file-drop/dir'), false)
+})
+
+test('Host locate route is available only in locate mode', async (t) => {
+  const root = await fixture(t)
+  const routes = await createRoutes(root)
+  const request = {
+    protocolVersion: 2, phase: 'metadata', sessionId: 'valid',
+    file: { kind: 'file', name: 'x.txt', size: 1, lastModified: 1 },
+  }
+  const blocked = await callRoute(routes, '/file-drop/locate', { body: request })
+  assert.equal(blocked.status, 409)
+  assert.equal(blocked.json.message, '当前为上传模式，未定位')
+  await enableLocate(routes)
+  assert.equal((await callRoute(routes, '/file-drop/locate', { body: request })).status, 200)
+})
+
+test('external search root route authorizes lists and revokes roots', async (t) => {
+  const root = await fixture(t)
+  const routes = await createRoutes(root)
+  const external = join(root, 'external')
+  await mkdir(external)
+  const initial = await callRoute(routes, SEARCH_ROOTS_PATH, { method: 'GET' })
+  assert.deepEqual(initial.json, { epoch: 0, roots: [] })
+  assert.equal((await callRoute(routes, SEARCH_ROOTS_PATH, { method: 'PUT', body: {} })).status, 405)
+  assert.equal((await callRoute(routes, SEARCH_ROOTS_PATH, { body: {}, contentType: 'text/plain' })).status, 415)
+  assert.equal((await callRoute(routes, SEARCH_ROOTS_PATH, { body: {}, origin: 'https://evil.example' })).status, 403)
+  assert.equal((await callRoute(routes, SEARCH_ROOTS_PATH, { body: {} })).status, 400)
+  assert.equal((await callRoute(routes, SEARCH_ROOTS_PATH, {
+    body: { action: 'authorize', path: join(root, 'missing') },
+  })).status, 400)
+  assert.equal((await callRoute(routes, SEARCH_ROOTS_PATH, {
+    body: { action: 'authorize', path: external, extra: true },
+  })).status, 400)
+  assert.equal((await callRoute(routes, SEARCH_ROOTS_PATH, {
+    body: { action: 'revoke', id: 'not-a-uuid' },
+  })).status, 400)
+
+  const added = await callRoute(routes, SEARCH_ROOTS_PATH, {
+    body: { action: 'authorize', path: external },
+  })
+  assert.equal(added.status, 200)
+  assert.equal(added.json.epoch, 1)
+  assert.equal(added.json.roots.length, 1)
+  assert.equal(added.json.roots[0].path, await realpath(external))
+  const id = added.json.roots[0].id
+  const duplicate = await callRoute(routes, SEARCH_ROOTS_PATH, {
+    body: { action: 'authorize', path: external },
+  })
+  assert.deepEqual(duplicate.json, added.json)
+  const revoked = await callRoute(routes, SEARCH_ROOTS_PATH, {
+    body: { action: 'revoke', id },
+  })
+  assert.deepEqual(revoked.json, { epoch: 2, roots: [] })
+  assert.equal((await callRoute(routes, SEARCH_ROOTS_PATH, {
+    body: { action: 'revoke', id },
+  })).status, 404)
+})
+
+test('authorized external root extends the real locate route', async (t) => {
+  const workspace = await fixture(t)
+  const external = await mkdtemp(join(tmpdir(), 'dsh-file-drop-route-external-'))
+  t.after(() => rm(external, { recursive: true, force: true }))
+  const filePath = join(external, 'outside-route.txt')
+  await writeFile(filePath, 'route-external-content')
+  const info = await stat(filePath)
+  const routes = await createRoutes(workspace)
+  await enableLocate(routes)
+  const initial = await callRoute(routes, '/file-drop/locate', {
+    body: {
+      protocolVersion: 2, phase: 'metadata', sessionId: 'valid',
+      file: { kind: 'file', name: 'outside-route.txt', size: info.size, lastModified: info.mtimeMs },
+    },
+  })
+  assert.equal(initial.status, 200)
+  assert.equal(initial.json.status, 'not-found')
+
+  const authorized = await callRoute(routes, SEARCH_ROOTS_PATH, {
+    body: { action: 'authorize', path: external },
+  })
+  assert.equal(authorized.status, 200)
+  const canonicalPath = join(authorized.json.roots[0].path, 'outside-route.txt')
+  const file = { kind: 'file', name: 'outside-route.txt', size: info.size, lastModified: info.mtimeMs }
+  const metadata = await callRoute(routes, '/file-drop/locate', {
+    body: { protocolVersion: 2, phase: 'metadata', sessionId: 'valid', file },
+  })
+  assert.equal(metadata.json.status, 'sample-required')
+  assert.deepEqual(metadata.json.candidates, [canonicalPath])
+  const sample = await callRoute(routes, '/file-drop/locate', {
+    body: {
+      protocolVersion: 2, phase: 'sample', sessionId: 'valid', file,
+      digest: await sampleFingerprint(canonicalPath, info.size), challenge: metadata.json.challenge,
+    },
+  })
+  assert.deepEqual(sample.json, { status: 'found', path: canonicalPath })
+})
+
+test('authorized external root extends real directory locating', async (t) => {
+  const workspace = await fixture(t)
+  const external = await mkdtemp(join(tmpdir(), 'dsh-file-drop-route-directory-'))
+  t.after(() => rm(external, { recursive: true, force: true }))
+  const firstDirectory = join(external, 'group-a', 'outside-dir')
+  const secondDirectory = join(external, 'group-b', 'outside-dir')
+  await mkdir(firstDirectory, { recursive: true })
+  await mkdir(secondDirectory, { recursive: true })
+  const firstChild = join(firstDirectory, 'child.txt')
+  const secondChild = join(secondDirectory, 'child.txt')
+  await writeFile(firstChild, 'directory-content')
+  await writeFile(secondChild, 'different-content')
+  const childInfo = await stat(firstChild)
+  const routes = await createRoutes(workspace)
+  await enableLocate(routes)
+  const authorized = await callRoute(routes, SEARCH_ROOTS_PATH, {
+    body: { action: 'authorize', path: external },
+  })
+  const canonicalRoot = authorized.json.roots[0].path
+  const canonicalDirectory = join(canonicalRoot, 'group-a', 'outside-dir')
+  const file = { kind: 'directory', name: 'outside-dir' }
+  const structure = {
+    truncated: false,
+    entries: [{ path: 'child.txt', kind: 'file', size: childInfo.size }],
+  }
+  const metadata = await callRoute(routes, '/file-drop/locate', {
+    body: { protocolVersion: 2, phase: 'metadata', sessionId: 'valid', file },
+  })
+  assert.equal(metadata.json.status, 'directory-structure-required')
+  const structureResult = await callRoute(routes, '/file-drop/locate', {
+    body: {
+      protocolVersion: 2, phase: 'directory-structure', sessionId: 'valid',
+      file: { ...file, structure }, candidates: metadata.json.candidates, challenge: metadata.json.challenge,
+    },
+  })
+  assert.equal(structureResult.json.status, 'directory-content-required')
+  assert.equal(structureResult.json.candidates.length, 2)
+  const sample = {
+    path: 'child.txt', size: childInfo.size,
+    digest: await sampleFingerprint(firstChild, childInfo.size),
+  }
+  const contentResult = await callRoute(routes, '/file-drop/locate', {
+    body: {
+      protocolVersion: 2, phase: 'directory-content', sessionId: 'valid',
+      file: { ...file, structure }, candidates: structureResult.json.candidates,
+      directorySamples: [sample], challenge: structureResult.json.challenge,
+    },
+  })
+  assert.deepEqual(contentResult.json, { status: 'found', path: canonicalDirectory })
+})
+
+test('locate response is written before external root revoke completes', async (t) => {
+  const workspace = await fixture(t)
+  const external = await mkdtemp(join(tmpdir(), 'dsh-file-drop-route-lock-'))
+  t.after(() => rm(external, { recursive: true, force: true }))
+  let release
+  let markStarted
+  const pending = new Promise((resolve) => { release = resolve })
+  const started = new Promise((resolve) => { markStarted = resolve })
+  const routes = await createRoutes(workspace, {
+    locateFn: async () => { markStarted(); await pending; return { status: 'not-found' } },
+  })
+  await enableLocate(routes)
+  const authorized = await callRoute(routes, SEARCH_ROOTS_PATH, {
+    body: { action: 'authorize', path: external },
+  })
+  const locate = callRoute(routes, '/file-drop/locate', {
+    body: {
+      protocolVersion: 2, phase: 'metadata', sessionId: 'valid',
+      file: { kind: 'file', name: 'blocked.txt', size: 1, lastModified: 1 },
+    },
+  })
+  await started
+  let revokeDone = false
+  const revoke = callRoute(routes, SEARCH_ROOTS_PATH, {
+    body: { action: 'revoke', id: authorized.json.roots[0].id },
+  }).then((result) => { revokeDone = true; return result })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(revokeDone, false)
+  release()
+  assert.equal((await locate).status, 200)
+  assert.equal((await revoke).status, 200)
+  assert.equal(revokeDone, true)
+})
+
+test('switching to upload waits for an in-flight locate response', async (t) => {
+  const root = await fixture(t)
+  let release
+  let markStarted
+  const pending = new Promise((resolve) => { release = resolve })
+  const started = new Promise((resolve) => { markStarted = resolve })
+  const routes = await createRoutes(root, {
+    locateFn: async () => { markStarted(); await pending; return { status: 'not-found' } },
+  })
+  await enableLocate(routes)
+  const request = {
+    protocolVersion: 2, phase: 'metadata', sessionId: 'valid',
+    file: { kind: 'file', name: 'x.txt', size: 1, lastModified: 1 },
+  }
+  const locating = callRoute(routes, '/file-drop/locate', { body: request })
+  await started
+  let switched = false
+  const switching = callRoute(routes, '/api/dsh-file-drop/settings', { body: { mode: 'upload' } })
+    .then((result) => { switched = true; return result })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(switched, false)
+  release()
+  assert.equal((await locating).status, 200)
+  assert.equal((await switching).json.mode, 'upload')
+  assert.equal((await callRoute(routes, '/file-drop/locate', { body: request })).status, 409)
 })
 
 test('settings persists the complete latest mode and quota schema', async (t) => {
@@ -250,7 +476,7 @@ test('size reclaims restart-orphaned staging while locate mode remains active', 
   const root = await fixture(t)
   const routes = await createRoutes(root)
   await callRoute(routes, '/api/dsh-file-drop/settings', { body: { mode: 'locate' } })
-  const orphan = join(root, '.dsh-drops', '.dsh-upload-staging', 'orphan.stage')
+  const orphan = join(root, '.dsh-drops', '.dsh-upload-staging', '11111111-1111-4111-8111-111111111111.dir')
   await mkdir(orphan, { recursive: true })
   await writeFile(join(orphan, 'partial.bin'), 'partial')
   const usage = await callRoute(routes, '/api/dsh-file-drop/size', { body: {} })
@@ -386,6 +612,7 @@ test('directory upload streams each file, preserves empty directories and valida
 test('locate route requires protocol v2, valid sessions and challenges', async (t) => {
   const root = await fixture(t)
   const routes = await createRoutes(root)
+  await enableLocate(routes)
   const file = { kind: 'file', name: 'x.txt', size: 1, lastModified: 1 }
   const unsupported = await callRoute(routes, '/file-drop/locate', {
     body: { protocolVersion: 1, phase: 'metadata', file },

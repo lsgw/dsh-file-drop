@@ -5,10 +5,14 @@ export {
 export {
   adoptSettings, beginModeChange, clearUserUploadRoot, currentMode, currentSettings, initializeSettings,
   modeRevision, openModeChannel, operationController, readUserUploadUsage, refreshModeForAction,
-  refreshSettings, uploadChunked, uploadFileChunks, writeSettings,
+  refreshSettings, subscribeSettings, uploadChunked, uploadFileChunks, writeSettings,
 } from './api.js'
 export {
-  abortableDelay, getDirectoryEntries,
+  authorizeExternalSearchRoot, currentExternalSearchRoots, openExternalSearchRootChannel,
+  readExternalSearchRoots, revokeExternalSearchRoot, subscribeExternalSearchRoots,
+} from './search-roots.js'
+export {
+  abortableDelay, getDirectoryEntries, getDroppedEntries,
   readEntryAll, shouldHandleDataTransfer,
 } from './drop-data.js'
 export { formatSize } from './format.js'
@@ -19,13 +23,17 @@ export {
   dropOwners, normalizeSessionId, retryWorkspaceContext, selectDropOwner,
 } from './session.js'
 export { chooseDropAction } from './drop-controller.js'
-export { statusStore } from './status.js'
+export { composerStatusStore, statusStore } from './status.js'
 
 import {
-  beginModeChange, clearUserUploadRoot, readUserUploadUsage, refreshModeForAction,
-  refreshSettings, uploadChunked, uploadFileChunks, writeSettings,
+  beginModeChange, clearUserUploadRoot, readUserUploadUsage, refreshModeForAction, refreshSettings,
+  subscribeSettings, uploadChunked, uploadFileChunks, writeSettings,
 } from './api.js'
-import { getDirectoryEntries, readEntryAll, shouldHandleDataTransfer } from './drop-data.js'
+import {
+  authorizeExternalSearchRoot, currentExternalSearchRoots, openExternalSearchRootChannel,
+  readExternalSearchRoots, revokeExternalSearchRoot, subscribeExternalSearchRoots, validExternalSearchRoots,
+} from './search-roots.js'
+import { getDirectoryEntries, getDroppedEntries, readEntryAll, shouldHandleDataTransfer } from './drop-data.js'
 import { chooseDropAction } from './drop-controller.js'
 import { processDirectoryUpload, processFilesUpload } from './upload-strategy.js'
 import { chooseDropOwner, retryWorkspaceContext } from './session.js'
@@ -41,12 +49,20 @@ export const clientTestApi = Object.freeze({
   chooseDropOwner,
   chooseDropAction,
   refreshSettings,
+  readExternalSearchRoots,
+  authorizeExternalSearchRoot,
+  revokeExternalSearchRoot,
+  currentExternalSearchRoots,
+  openExternalSearchRootChannel,
+  subscribeExternalSearchRoots,
+  validExternalSearchRoots,
   refreshModeForAction,
   beginModeChange,
   readUserUploadUsage,
   clearUserUploadRoot,
   writeSettings,
   getDirectoryEntries,
+  getDroppedEntries,
   retryWorkspaceContext,
   shouldHandleDataTransfer,
 })

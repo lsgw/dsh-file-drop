@@ -2,11 +2,14 @@ export const PLUGIN_ID = 'dsh-file-drop'
 export const API_PATH = '/api/dsh-file-drop'
 export const UPLOAD_PATH = API_PATH + '/upload'
 export const SETTINGS_PATH = API_PATH + '/settings'
+export const SEARCH_ROOTS_PATH = API_PATH + '/search-roots'
 export const FILE_DROP_ROUTE = '/file-drop/locate'
 
 export const MAX_TOP_LEVEL_FILES = 500
 export const MAX_DIRECTORY_ENTRIES = 10000
 export const MAX_ROOT_DIRECTORIES = 32
+export const MAX_EXTERNAL_SEARCH_ROOTS = 16
+export const MAX_EXTERNAL_SEARCH_ROOT_PATH_LENGTH = 32768
 export const MAX_UPLOAD_QUOTA_MIB = 1024 * 1024
 export const MAX_UPLOAD_QUOTA_ENTRIES = 100000
 export const MIB_BYTES = 1024 * 1024
@@ -26,6 +29,8 @@ export const MAX_UPLOAD_MANIFEST_BYTES = 48 * 1024 * 1024
 export const MAX_UPLOAD_CONTROL_BYTES = 1024 * 1024
 
 export const LOCATE_PROTOCOL_VERSION = 2
+export const LOCATE_MAX_REQUEST_BYTES = 16 * 1024 * 1024
+export const LOCATE_MAX_STRUCTURE_BYTES = 12 * 1024 * 1024
 export const LOCATE_SAMPLE_BYTES = 64 * 1024
 export const LOCATE_FULL_MAX_BYTES = 8 * 1024 * 1024
 export const LOCATE_MAX_DEPTH = 32

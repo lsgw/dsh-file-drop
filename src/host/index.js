@@ -1,12 +1,14 @@
 // dsh-file-drop / Host routes.
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { HttpError, clearDropRoot, dshHome, dropCleanupStatus, measureDropRoot, readJsonBody } from './safety.js'
-import { requireBinary, requireJson, requireMethod, sameOriginRequest, sendError, sendJson, sendLocateError } from './http.js'
-import { API_PATH } from '../shared/contract.js'
+import { createReadWriteGate } from './gate.js'
+import { drainRequest, requireBinary, requireJson, requireMethod, sameOriginRequest, sendError, sendJson, sendLocateError } from './http.js'
+import { API_PATH, LOCATE_MAX_REQUEST_BYTES } from '../shared/contract.js'
 import { createSecureLocator } from '../locate/secure-locator.js'
 import { FILE_DROP_ROUTE } from '../locate/protocol.js'
 import { physicalPathKey } from '../shared/node-path.js'
 import { createSettingsStore, quotaFromSettings } from './settings.js'
+import { createSearchRootStore, registerSearchRootRoute } from './search-roots.js'
 import {
   MAX_UPLOAD_CONTROL_BYTES,
   MAX_UPLOAD_MANIFEST_BYTES,
@@ -34,16 +36,17 @@ export function createPathLock() {
 }
 
 async function applyWithSettingsPath(ctx, settingsPath, options = {}) {
-  const secureLocate = createSecureLocator(ctx)
   const withPathLock = createPathLock()
   const uploadBaseDir = resolve(options.uploadBaseDir || dshHome())
   const settingsStore = createSettingsStore(settingsPath)
-  let settingsTail = Promise.resolve()
-  const enqueueSettings = (operation) => {
-    const current = settingsTail.catch(() => {}).then(operation)
-    settingsTail = current
-    return current
-  }
+  const searchRootStore = createSearchRootStore(options.searchRootsPath
+    || join(dirname(settingsPath), 'dsh-file-drop-search-roots.json'))
+  const secureLocate = createSecureLocator(ctx, {
+    getExternalSearchRoots: () => searchRootStore.trusted(),
+    ...(typeof options.locateFn === 'function' ? { locateFn: options.locateFn } : {}),
+  })
+  const settingsGate = createReadWriteGate()
+  const enqueueSettings = settingsGate.write
   const uploadManager = createUploadManager(ctx, {
     ...(options.uploadManager || {}),
     withPathLock,
@@ -61,7 +64,7 @@ async function applyWithSettingsPath(ctx, settingsPath, options = {}) {
       path: API_PATH + '/upload/' + suffix,
       handler: async (req, res) => {
         try {
-          if (!sameOriginRequest(req)) { sendJson(res, 403, { error: '跨源请求被拒绝' }); return }
+          if (!sameOriginRequest(req)) { drainRequest(req); sendJson(res, 403, { error: '跨源请求被拒绝' }); return }
           if (!requireMethod(req, res, ['POST'])) return
           requireJson(req)
           const payload = await readJsonBody(req, maxBytes)
@@ -98,11 +101,18 @@ async function applyWithSettingsPath(ctx, settingsPath, options = {}) {
     path: FILE_DROP_ROUTE,
     handler: async (req, res) => {
       try {
-        if (!sameOriginRequest(req)) { sendJson(res, 403, { status: 'error', message: '跨源请求被拒绝' }); return }
+        if (!sameOriginRequest(req)) { drainRequest(req); sendJson(res, 403, { status: 'error', message: '跨源请求被拒绝' }); return }
         if (!requireMethod(req, res, ['POST'])) return
         requireJson(req)
-        const request = await readJsonBody(req, 4 * 1024 * 1024)
-        sendJson(res, 200, await secureLocate(request))
+        const request = await readJsonBody(req, LOCATE_MAX_REQUEST_BYTES)
+        await settingsGate.read(async () => {
+          if (settingsStore.read().mode !== 'locate') {
+            throw new HttpError(409, '当前为上传模式，未定位')
+          }
+          await searchRootStore.withRead(async () => {
+            sendJson(res, 200, await secureLocate(request))
+          })
+        })
       } catch (error) {
         sendLocateError(res, error)
       }
@@ -114,11 +124,10 @@ async function applyWithSettingsPath(ctx, settingsPath, options = {}) {
     path: API_PATH + '/settings',
     handler: async (req, res) => {
       try {
-        if (!sameOriginRequest(req)) { sendJson(res, 403, { error: '跨源请求被拒绝' }); return }
+        if (!sameOriginRequest(req)) { drainRequest(req); sendJson(res, 403, { error: '跨源请求被拒绝' }); return }
         if (!requireMethod(req, res, ['GET', 'POST'])) return
         if (req.method === 'GET') {
-          await settingsTail.catch(() => {})
-          sendJson(res, 200, settingsStore.read())
+          await settingsGate.read(() => sendJson(res, 200, settingsStore.read()))
           return
         }
         requireJson(req)
@@ -139,12 +148,14 @@ async function applyWithSettingsPath(ctx, settingsPath, options = {}) {
     },
   }), 'dsh-file-drop: settings route')
 
+  registerSearchRootRoute(ctx, searchRootStore)
+
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
     path: API_PATH + '/clear',
     handler: async (req, res) => {
       try {
-        if (!sameOriginRequest(req)) { sendJson(res, 403, { error: '跨源请求被拒绝' }); return }
+        if (!sameOriginRequest(req)) { drainRequest(req); sendJson(res, 403, { error: '跨源请求被拒绝' }); return }
         if (!requireMethod(req, res, ['POST'])) return
         requireJson(req)
         const payload = await readJsonBody(req, 1024 * 1024)
@@ -170,7 +181,7 @@ async function applyWithSettingsPath(ctx, settingsPath, options = {}) {
     path: API_PATH + '/size',
     handler: async (req, res) => {
       try {
-        if (!sameOriginRequest(req)) { sendJson(res, 403, { error: '跨源请求被拒绝' }); return }
+        if (!sameOriginRequest(req)) { drainRequest(req); sendJson(res, 403, { error: '跨源请求被拒绝' }); return }
         if (!requireMethod(req, res, ['POST'])) return
         requireJson(req)
         const payload = await readJsonBody(req, 1024 * 1024)

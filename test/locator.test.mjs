@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { join, normalize } from 'node:path'
 
 import { readNodeDirectoryStructure } from '../src/locate/directory-node.js'
-import { fullFingerprint, sampleFingerprint, sampleRanges } from '../src/locate/fingerprint.js'
+import { fullFingerprint, readRange, sampleFingerprint, sampleRanges } from '../src/locate/fingerprint.js'
 import { locate } from '../src/locate/locator.js'
 import { activeIsolatedTasks, runIsolatedTask } from '../src/locate/isolate.js'
 import { SAMPLE_BYTES, SMALL_FILE_BYTES } from '../src/locate/protocol.js'
@@ -78,6 +78,22 @@ test('unconfirmed isolated worker termination retains its slot until close', asy
   assert.equal(activeIsolatedTasks(), 1)
   child.emit('close', 1)
   assert.equal(activeIsolatedTasks(), 0)
+})
+
+test('sample range reader loops across valid short reads', async () => {
+  const source = Buffer.from('abcdef')
+  const calls = []
+  const handle = {
+    async read(buffer, offset, length, position) {
+      calls.push({ offset, length, position })
+      const bytesRead = Math.min(2, length, source.length - position)
+      if (bytesRead > 0) source.copy(buffer, offset, position, position + bytesRead)
+      return { bytesRead }
+    },
+  }
+  assert.equal((await readRange(handle, 0, source.length)).toString(), 'abcdef')
+  assert.equal(calls.length, 3)
+  await assert.rejects(readRange(handle, source.length, 1), /file changed/)
 })
 
 test('sample ranges cover small and large file boundaries', () => {
@@ -330,6 +346,20 @@ test('truncated directory fingerprints never auto-select a candidate', async (t)
     candidates: [directory],
   })
   assert.deepEqual(result, { status: 'choose', candidates: [normalize(directory)] })
+})
+
+test('POSIX top-level names preserve backslashes', async (t) => {
+  if (process.platform === 'win32') return t.skip('backslash is a path separator on Windows')
+  const root = await fixture(t, 'top-level-backslash')
+  const name = 'a\\b.txt'
+  await writeFile(join(root, name), 'x')
+  const result = await locate({
+    phase: 'metadata',
+    file: { kind: 'file', name, size: 1, lastModified: 0 },
+    currentWorkspacePath: root,
+    workspacePaths: [root],
+  })
+  assert.equal(result.status, 'sample-required')
 })
 
 test('malformed protocol fields return explicit errors', async (t) => {

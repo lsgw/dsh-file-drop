@@ -12,6 +12,7 @@ import {
 import { HttpError, errorMessage, quotaExceeded, truncateComponent } from './manifest.js'
 
 export const UPLOAD_STAGING_DIRECTORY = '.dsh-upload-staging'
+const UPLOAD_STAGE_NAME_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(?:file|dir)$/
 const MAX_SIZE_ENTRIES = MAX_UPLOAD_QUOTA_ENTRIES
 const MAX_SIZE_DEPTH = 64
 const MAX_SIZE_BYTES = MAX_UPLOAD_QUOTA_BYTES
@@ -113,23 +114,6 @@ async function quarantinePaths(baseDir) {
   return paths
 }
 
-function trackQuarantineCleanup(baseDir, quarantine) {
-  const stateKey = cleanupStateKey(baseDir)
-  const state = { pending: true, error: undefined, promise: undefined }
-  setCleanupState(stateKey, state)
-  const cleanup = Promise.resolve().then(() => removeQuarantine(quarantine)).then(() => {
-    if (cleanupStates.get(stateKey) === state) cleanupStates.delete(stateKey)
-  }, (error) => {
-    if (cleanupStates.get(stateKey) === state) {
-      state.pending = false
-      state.error = errorMessage(error)
-    }
-    throw error
-  })
-  state.promise = cleanup
-  void cleanup.catch(() => {})
-}
-
 async function cleanupQuarantines(baseDir) {
   try {
     const errors = []
@@ -139,6 +123,18 @@ async function cleanupQuarantines(baseDir) {
     return errors
   } catch (error) {
     return [error]
+  }
+}
+
+async function retryCleanupState(baseDir) {
+  const stateKey = cleanupStateKey(baseDir)
+  const prior = cleanupStates.get(stateKey)
+  if (prior?.promise) await prior.promise.catch(() => {})
+  const errors = await cleanupQuarantines(baseDir)
+  if (errors.length > 0) {
+    setCleanupState(stateKey, { pending: false, error: errorMessage(errors[0]) })
+  } else {
+    cleanupStates.delete(stateKey)
   }
 }
 
@@ -153,16 +149,6 @@ export async function ensureDropRoot(baseDir) {
   return root
 }
 
-async function assertSafeTarget(path, expectedDirectory) {
-  const info = await existingInfo(path)
-  if (!info) return false
-  if (info.isSymbolicLink()) throw new HttpError(409, 'unsafe symlink target')
-  if (expectedDirectory ? !info.isDirectory() : !info.isFile()) {
-    throw new HttpError(409, 'target type conflict')
-  }
-  return true
-}
-
 function numberedName(name, index) {
   if (index === 0) return name
   const dot = name.lastIndexOf('.')
@@ -175,7 +161,7 @@ function numberedName(name, index) {
   return truncateComponent(stem, stemUnits, stemBytes) + suffix + safeExtension
 }
 
-async function availableFileTarget(root, name) {
+async function availableTarget(root, name) {
   for (let index = 0; index <= 9999; index += 1) {
     const target = join(root, numberedName(name, index))
     const info = await existingInfo(target)
@@ -217,15 +203,19 @@ export async function cleanupOrphanUploadStages(baseDir, activeNames = new Set()
   const dropRoot = await ensureDropRoot(baseDir)
   const candidate = join(dropRoot, UPLOAD_STAGING_DIRECTORY)
   const info = await existingInfo(candidate)
-  if (!info) return false
+  if (!info) { await retryCleanupState(baseDir); return false }
   if (info.isSymbolicLink() || !info.isDirectory()) throw new HttpError(409, 'unsafe upload staging root')
   const { stagingRoot } = await ensureUploadStagingRoot(baseDir)
   const handle = await opendir(stagingRoot)
   for await (const entry of handle) {
     if (activeNames.has(entry.name)) continue
+    if (!UPLOAD_STAGE_NAME_RE.test(entry.name)) {
+      throw new HttpError(409, 'unknown upload staging entry requires manual review')
+    }
     await removeInternalUploadPath(join(stagingRoot, entry.name))
   }
   await removeEmptyStagingRoot(stagingRoot)
+  await retryCleanupState(baseDir)
   return Boolean(await existingInfo(stagingRoot))
 }
 
@@ -319,7 +309,29 @@ async function writeAll(handle, data, position) {
   }
 }
 
-export async function writeUploadChunk(req, stage, fileIndex, offset, maxChunkBytes) {
+async function nextUploadChunk(req, iterator, deadline) {
+  const remaining = deadline - Date.now()
+  if (remaining <= 0) {
+    if (typeof req.destroy === 'function') req.destroy()
+    throw new HttpError(408, 'upload chunk timed out')
+  }
+  let timer
+  try {
+    return await Promise.race([
+      iterator.next(),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          if (typeof req.destroy === 'function') req.destroy()
+          reject(new HttpError(408, 'upload chunk timed out'))
+        }, remaining)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+export async function writeUploadChunk(req, stage, fileIndex, offset, maxChunkBytes, options = {}) {
   if (!Number.isSafeInteger(fileIndex) || fileIndex < 0 || fileIndex >= stage.files.length) {
     if (typeof req.resume === 'function') req.resume()
     throw new HttpError(400, 'invalid upload file index')
@@ -343,11 +355,16 @@ export async function writeUploadChunk(req, stage, fileIndex, offset, maxChunkBy
     }
   }
   await assertUploadStageFile(stage, file)
+  const timeoutMs = Math.max(1, Math.min(options.timeoutMs || 30_000, 120_000))
+  const deadline = Date.now() + timeoutMs
+  const iterator = req[Symbol.asyncIterator]()
   const handle = await open(file.path, 'r+')
   let received = 0
   try {
-    for await (const chunk of req) {
-      const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    while (true) {
+      const next = await nextUploadChunk(req, iterator, deadline)
+      if (next.done) break
+      const data = Buffer.isBuffer(next.value) ? next.value : Buffer.from(next.value)
       if (received + data.length > expected) {
         if (typeof req.resume === 'function') req.resume()
         throw new HttpError(413, 'upload chunk exceeds negotiated size')
@@ -356,6 +373,7 @@ export async function writeUploadChunk(req, stage, fileIndex, offset, maxChunkBy
       received += data.length
     }
   } finally {
+    if (typeof iterator.return === 'function') void Promise.resolve(iterator.return()).catch(() => {})
     await handle.close()
   }
   if (received !== expected) throw new HttpError(400, 'upload chunk size mismatch')
@@ -372,42 +390,6 @@ export async function verifyUploadStage(stage) {
   }
 }
 
-async function commitStagedDirectory(baseDir, stage, beforeCommit) {
-  const target = join(stage.dropRoot, stage.name)
-  const backup = join(stage.dropRoot, '.' + stage.name + '.bak')
-  let existed = await assertSafeTarget(target, true)
-  const backupExists = await assertSafeTarget(backup, true)
-  if (beforeCommit) beforeCommit()
-  if (backupExists) {
-    if (existed) await rm(backup, { recursive: true, force: true })
-    else { await rename(backup, target); existed = true }
-  }
-  await assertPlainDirectory(stage.dropRoot)
-  await assertPlainDirectory(stage.path)
-  if (existed) await rename(target, backup)
-  try {
-    if (beforeCommit) beforeCommit()
-    await rename(stage.path, target)
-  } catch (error) {
-    if (existed) {
-      try { await rename(backup, target) } catch (restoreError) {
-        throw new AggregateError([error, restoreError], 'directory replacement and rollback failed')
-      }
-    }
-    throw error
-  }
-  if (existed) {
-    const quarantine = join(baseDir, '.dsh-drops.deleting-' + randomUUID())
-    try {
-      await rename(backup, quarantine)
-      trackQuarantineCleanup(baseDir, quarantine)
-    } catch (error) {
-      setCleanupState(cleanupStateKey(baseDir), { pending: false, error: errorMessage(error) })
-    }
-  }
-  return target
-}
-
 async function removeEmptyStagingRoot(stagingRoot) {
   try { await rmdir(stagingRoot) } catch (error) {
     if (error?.code !== 'ENOENT' && error?.code !== 'ENOTEMPTY' && error?.code !== 'EEXIST') throw error
@@ -416,16 +398,18 @@ async function removeEmptyStagingRoot(stagingRoot) {
 
 export async function commitUploadStage(baseDir, stage, options = {}) {
   await verifyUploadStage(stage)
-  let target
-  if (stage.kind === 'directory') target = await commitStagedDirectory(baseDir, stage, options.beforeCommit)
-  else {
-    target = await availableFileTarget(stage.dropRoot, stage.name)
-    await assertPlainDirectory(stage.dropRoot)
-    await assertPlainDirectory(stage.stagingRoot)
-    if (options.beforeCommit) options.beforeCommit()
-    await rename(stage.path, target)
+  const cleanupStagingRoot = options.cleanupStagingRoot || removeEmptyStagingRoot
+  const target = await availableTarget(stage.dropRoot, stage.name)
+  await assertPlainDirectory(stage.dropRoot)
+  await assertPlainDirectory(stage.stagingRoot)
+  if (stage.kind === 'directory') await assertPlainDirectory(stage.path)
+  if (options.beforeCommit) options.beforeCommit()
+  await rename(stage.path, target)
+  try {
+    await cleanupStagingRoot(stage.stagingRoot)
+  } catch (error) {
+    setCleanupState(cleanupStateKey(baseDir), { pending: false, error: errorMessage(error) })
   }
-  await removeEmptyStagingRoot(stage.stagingRoot)
   return target
 }
 

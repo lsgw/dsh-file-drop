@@ -252,9 +252,10 @@ test('staged file and directory commits are atomic and orphan stages are reclaim
     kind: 'directory', name: 'folder', entries: [{ kind: 'file', path: 'new.txt', size: 3 }],
   }), randomUUID())
   await writeUploadChunk(requestFrom([Buffer.from('new')], { 'content-length': '3' }), replacementStage, 0, 0, 16)
-  await commitUploadStage(base, replacementStage)
-  assert.equal(await readFile(join(directoryPath, 'new.txt'), 'utf8'), 'new')
-  await assert.rejects(readFile(join(directoryPath, 'nested', 'a.txt')))
+  const numberedDirectoryPath = await commitUploadStage(base, replacementStage)
+  assert.notEqual(numberedDirectoryPath, directoryPath)
+  assert.equal(await readFile(join(directoryPath, 'nested', 'a.txt'), 'utf8'), 'A')
+  assert.equal(await readFile(join(numberedDirectoryPath, 'new.txt'), 'utf8'), 'new')
 
   const orphan = await createUploadStage(base, decodeUploadManifest({ kind: 'file', name: 'orphan.bin', size: 2 }), randomUUID())
   await cleanupOrphanUploadStages(base, new Set())
@@ -264,8 +265,8 @@ test('staged file and directory commits are atomic and orphan stages are reclaim
     await new Promise((resolve) => setImmediate(resolve))
   }
   const measured = await measureDropRoot(base)
-  assert.equal(measured.size, 9)
-  assert.equal(measured.entries, 4)
+  assert.equal(measured.size, 12)
+  assert.equal(measured.entries, 9)
 
   await clearDropRoot(base, { waitForCleanup: true })
   assert.deepEqual(await measureDropRoot(base), { path: join(base, '.dsh-drops'), size: 0, entries: 0 })
@@ -275,7 +276,56 @@ test('staged file and directory commits are atomic and orphan stages are reclaim
 
 
 
-test('mode rejection immediately before commit leaves no file and restores replaced directories', async (t) => {
+test('orphan cleanup preserves unknown staging entries', async (t) => {
+  const root = await fixture(t, 'unknown-staging')
+  const base = join(root, 'workspace')
+  const stage = await createUploadStage(base, decodeUploadManifest({
+    kind: 'file', name: 'known.bin', size: 0,
+  }), randomUUID())
+  const unknown = join(stage.stagingRoot, 'user-data')
+  await mkdir(unknown)
+  await writeFile(join(unknown, 'keep.txt'), 'keep')
+  await rejectsStatus(cleanupOrphanUploadStages(base, new Set([stage.stageName])), 409)
+  assert.equal(await readFile(join(unknown, 'keep.txt'), 'utf8'), 'keep')
+  await rm(unknown, { recursive: true })
+  await removeUploadStage(stage)
+})
+
+test('top-level directory sanitization collisions are numbered without overwriting', async (t) => {
+  const root = await fixture(t, 'directory-collisions')
+  const base = join(root, 'workspace')
+  const names = ['folder', 'folder.', 'folder ', 'a:b', 'a_b']
+  const paths = []
+  for (const name of names) {
+    const stage = await createUploadStage(base, decodeUploadManifest({ kind: 'directory', name, entries: [] }), randomUUID())
+    const path = await commitUploadStage(base, stage)
+    paths.push(path)
+    await writeFile(join(path, 'marker.txt'), name)
+  }
+  assert.equal(new Set(paths).size, names.length)
+  for (let index = 0; index < paths.length; index += 1) {
+    assert.equal(await readFile(join(paths[index], 'marker.txt'), 'utf8'), names[index])
+  }
+})
+
+test('post-commit staging cleanup failure still returns the committed path', async (t) => {
+  const root = await fixture(t, 'post-commit-cleanup')
+  const base = join(root, 'workspace')
+  const stage = await createUploadStage(base, decodeUploadManifest({
+    kind: 'file', name: 'committed.txt', size: 0,
+  }), randomUUID())
+  const path = await commitUploadStage(base, stage, {
+    cleanupStagingRoot: async () => { throw new Error('cleanup failed') },
+  })
+  assert.equal(path, join(base, '.dsh-drops', 'committed.txt'))
+  assert.equal((await stat(path)).isFile(), true)
+  assert.match(dropCleanupStatus(base).cleanupError, /cleanup failed/)
+  await cleanupOrphanUploadStages(base, new Set())
+  assert.deepEqual(dropCleanupStatus(base), { cleanupPending: false })
+  await assertDropRootCapacity(base, 0, 0)
+})
+
+test('mode rejection immediately before commit leaves no new file or directory', async (t) => {
   const root = await fixture(t, 'commit-mode-rejection')
   const base = join(root, 'workspace')
   const fileStage = await createUploadStage(
@@ -301,10 +351,10 @@ test('mode rejection immediately before commit leaves no file and restores repla
   await assert.rejects(commitUploadStage(base, directoryStage, {
     beforeCommit() {
       checks += 1
-      if (checks === 2) throw new HttpError(409, '当前为定位模式，未上传', 'locate_mode')
+      if (checks === 1) throw new HttpError(409, '当前为定位模式，未上传', 'locate_mode')
     },
   }), (error) => error.code === 'locate_mode')
-  assert.equal(checks, 2)
+  assert.equal(checks, 1)
   assert.equal(await readFile(join(target, 'old.txt'), 'utf8'), 'old')
   await stat(directoryStage.path)
   await removeUploadStage(directoryStage)

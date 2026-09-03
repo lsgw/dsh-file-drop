@@ -4,7 +4,7 @@ import { lstat, mkdtemp, mkdir, readdir, rm, symlink, writeFile } from 'node:fs/
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
-import { collisionKey, pathKey, physicalPathKey, sameDirectoryEntry } from '../src/shared/node-path.js'
+import { collisionKey, objectKey, pathKey, physicalPathKey, sameDirectoryEntry } from '../src/shared/node-path.js'
 
 test('lexical keys preserve Unicode spelling and collision keys normalize it', () => {
   const decomposed = pathKey(join(tmpdir(), 'e\u0301'))
@@ -12,6 +12,12 @@ test('lexical keys preserve Unicode spelling and collision keys normalize it', (
   assert.notEqual(decomposed, composed)
   assert.equal(collisionKey(['e\u0301']), collisionKey(['é']))
   assert.equal(pathKey(resolve('.')), pathKey(resolve('.')))
+})
+
+test('physical keys require both stable device and inode identities', () => {
+  assert.equal(objectKey('/canonical', { dev: 0n, ino: 7n }), 'real:/canonical')
+  assert.equal(objectKey('/canonical', { dev: 3n, ino: 0n }), 'real:/canonical')
+  assert.equal(objectKey('/canonical', { dev: 3n, ino: 7n }), 'inode:3:7')
 })
 
 test('physical path keys resolve aliases of the same entry', async (t) => {
